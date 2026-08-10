@@ -89,23 +89,53 @@ app = FastAPI(title="Shorts Auto", version="2.1.0")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def prepare_caption(text: str, width: int = 28) -> str:
-    """
-    Wrap text into short lines and escape for FFmpeg drawtext.
-
-    Escaping is applied to each line BEFORE joining with \\N so the
-    newline marker is never double-escaped by the backslash replacement.
-    """
-    lines = textwrap.wrap(text, width=width) or [text]
-    escaped = [
-        line
+def escape_line(text: str) -> str:
+    """Escape a single line of text for safe use inside FFmpeg drawtext text='' value."""
+    return (
+        text
         .replace("\\", r"\\")   # must be first
         .replace("'",  r"\'")
         .replace(":",  r"\:")
         .replace("%",  r"\%")
-        for line in lines
-    ]
-    return r"\N".join(escaped)   # \N = FFmpeg drawtext forced newline
+    )
+
+
+def caption_drawtext_filters(text: str, duration: float,
+                              words_per_chunk: int = 3) -> list[str]:
+    """
+    Build a list of FFmpeg drawtext filter strings that show the caption
+    three words at a time, each chunk appearing for an equal slice of the
+    scene duration, with a semi-transparent black background box.
+
+    Example for duration=9s, 9 words:
+      chunk 0: words 1-3  shown from t=0   to t=3
+      chunk 1: words 4-6  shown from t=3   to t=6
+      chunk 2: words 7-9  shown from t=6   to t=9
+    """
+    words = text.split()
+    chunks = [
+        " ".join(words[i : i + words_per_chunk])
+        for i in range(0, max(len(words), 1), words_per_chunk)
+    ] or [text]
+
+    chunk_dur = duration / len(chunks)
+    filters = []
+    for i, chunk in enumerate(chunks):
+        t_start = i * chunk_dur
+        t_end   = (i + 1) * chunk_dur
+        escaped = escape_line(chunk)
+        filters.append(
+            f"drawtext=text='{escaped}'"
+            f":enable='between(t,{t_start:.3f},{t_end:.3f})'"
+            ":fontcolor=white"
+            ":fontsize=58"
+            ":box=1"
+            ":boxcolor=black@0.65"
+            ":boxborderw=22"
+            ":x=(w-text_w)/2"
+            ":y=h-text_h-220"
+        )
+    return filters
 
 
 
@@ -178,8 +208,7 @@ async def render_short(
         for scene in sorted(scene_data, key=lambda s: s["sceneNumber"]):
             num      = scene["sceneNumber"]
             duration = float(scene["durationSeconds"])
-            caption  = prepare_caption(scene["text"])
-            log.info("Scene %d | duration=%.1fs | caption=%r", num, duration, caption)
+            log.info("Scene %d | duration=%.1fs | text=%r", num, duration, scene["text"])
 
             # Read → write → del: never hold more than one clip in RAM at once
             raw_path = os.path.join(tmp, f"raw{num}.mp4")
@@ -202,11 +231,12 @@ async def render_short(
 
             clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
+            # Build one drawtext filter per 3-word chunk, timed across the scene
+            drawtext_parts = caption_drawtext_filters(scene["text"], duration)
             vf = (
                 "scale=1080:1920:force_original_aspect_ratio=increase,"
                 "crop=1080:1920,"
-                f"drawtext=text='{caption}':fontcolor=white:fontsize=48:"
-                "borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-380:line_spacing=10"
+                + ",".join(drawtext_parts)
             )
 
             # Encode this scene clip (no audio; muxed at the end)
