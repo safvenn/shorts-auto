@@ -130,18 +130,23 @@ def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
 
 # ── Caption rendering (Pillow) ────────────────────────────────────────────────
 
-def emoji_for_chunk(chunk: str) -> str:
-    """Return a single emoji to append to a caption chunk; '' if no match."""
+def emoji_for_chunk(chunk: str) -> tuple[str, str]:
+    """
+    Return (clean_chunk_text, emoji_str).
+    If a keyword matches, returns (chunk, emoji). Otherwise returns (chunk, "").
+    """
     for word in chunk.lower().split():
         clean = word.strip(".,!?;:")
         if clean in EMOJI_MAP:
-            return " " + EMOJI_MAP[clean]
-    return ""
+            return chunk, " " + EMOJI_MAP[clean]
+    return chunk, ""
 
 
 def render_caption_png(
-    text: str,
+    chunk_text: str,
+    emoji_str: str,
     bold_font_path: str,
+    emoji_font_path: str,
     font_size: int = CAPTION_FONT_SIZE,
 ) -> Image.Image:
     """
@@ -152,43 +157,74 @@ def render_caption_png(
     - Black stroke (border) CAPTION_STROKE_W px thick
     - Black drop shadow offset CAPTION_SHADOW_OFF px
     - Transparent background → composites cleanly over video
-    - Max width: VIDEO_W - 40px
+    - Color emoji rendered if NotoColorEmoji is available
     """
     bold_font = _load_font(bold_font_path, font_size)
+    emoji_font = _load_font(emoji_font_path, font_size) if emoji_font_path else None
 
     pad_x, pad_y = 28, 18
     probe = Image.new("RGBA", (VIDEO_W * 2, font_size * 4), (0, 0, 0, 0))
     probe_draw = ImageDraw.Draw(probe)
-    bbox = probe_draw.textbbox(
-        (0, 0), text, font=bold_font,
-        stroke_width=CAPTION_STROKE_W,
-    )
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
 
-    img_w = min(text_w + pad_x * 2, VIDEO_W - 20)
-    img_h = text_h + pad_y * 2 + CAPTION_SHADOW_OFF
+    bbox_text = probe_draw.textbbox((0, 0), chunk_text, font=bold_font, stroke_width=CAPTION_STROKE_W)
+    text_w = bbox_text[2] - bbox_text[0]
+    text_h = bbox_text[3] - bbox_text[1]
+
+    emoji_w = 0
+    emoji_h = text_h
+    if emoji_str:
+        ef = emoji_font if emoji_font else bold_font
+        bbox_emoji = probe_draw.textbbox((0, 0), emoji_str, font=ef)
+        emoji_w = bbox_emoji[2] - bbox_emoji[0]
+        emoji_h = max(text_h, bbox_emoji[3] - bbox_emoji[1])
+
+    total_w = text_w + (emoji_w if emoji_str else 0)
+    img_w = min(total_w + pad_x * 2 + 10, VIDEO_W - 20)
+    img_h = max(text_h, emoji_h) + pad_y * 2 + CAPTION_SHADOW_OFF
 
     img  = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    x = pad_x - bbox[0]
-    y = pad_y - bbox[1]
+    x = pad_x - bbox_text[0]
+    y = pad_y - bbox_text[1]
 
-    # 1. Drop shadow (black, semi-transparent)
+    # 1. Drop shadow for text
     draw.text(
         (x + CAPTION_SHADOW_OFF, y + CAPTION_SHADOW_OFF),
-        text, font=bold_font,
+        chunk_text, font=bold_font,
         fill=(0, 0, 0, 170),
     )
 
     # 2. Main text with black stroke then yellow fill
     draw.text(
-        (x, y), text, font=bold_font,
+        (x, y), chunk_text, font=bold_font,
         fill=(255, 230, 0, 255),
         stroke_width=CAPTION_STROKE_W,
         stroke_fill=(0, 0, 0, 255),
     )
+
+    # 3. Draw emoji if present
+    if emoji_str:
+        x_emoji = x + text_w + 10
+        ef = emoji_font if emoji_font else bold_font
+        try:
+            if emoji_font:
+                draw.text((x_emoji, y), emoji_str, font=ef, embedded_color=True)
+            else:
+                draw.text(
+                    (x_emoji, y), emoji_str, font=ef,
+                    fill=(255, 230, 0, 255),
+                    stroke_width=CAPTION_STROKE_W,
+                    stroke_fill=(0, 0, 0, 255),
+                )
+        except Exception:
+            # Fallback if embedded_color fails
+            draw.text(
+                (x_emoji, y), emoji_str, font=bold_font,
+                fill=(255, 230, 0, 255),
+                stroke_width=CAPTION_STROKE_W,
+                stroke_fill=(0, 0, 0, 255),
+            )
 
     return img
 
@@ -197,6 +233,7 @@ def make_caption_overlays(
     text: str,
     duration: float,
     bold_font_path: str,
+    emoji_font_path: str,
     tmp_dir: str,
     scene_num: int,
 ) -> list[tuple[str, float, float]]:
@@ -219,14 +256,14 @@ def make_caption_overlays(
         t_start = i * chunk_dur
         t_end   = (i + 1) * chunk_dur
 
-        display = chunk + emoji_for_chunk(chunk)
-        img     = render_caption_png(display, bold_font_path)
+        clean_chunk, emoji_str = emoji_for_chunk(chunk)
+        img = render_caption_png(clean_chunk, emoji_str, bold_font_path, emoji_font_path)
         png_path = os.path.join(tmp_dir, f"cap_s{scene_num}_{i:03d}.png")
         img.save(png_path, "PNG")
         overlays.append((png_path, t_start, t_end))
         log.info(
-            "Cap PNG s%d[%d] '%s' [%.3f,%.3f] size=%dx%d",
-            scene_num, i, display, t_start, t_end, img.width, img.height,
+            "Cap PNG s%d[%d] '%s%s' [%.3f,%.3f] size=%dx%d",
+            scene_num, i, clean_chunk, emoji_str, t_start, t_end, img.width, img.height,
         )
 
     return overlays
@@ -275,7 +312,9 @@ async def render_short(
     scene_data = json.loads(scenes)
     uploads    = {1: video1, 2: video2, 3: video3, 4: video4}
     bold_font  = _find_font(_BOLD_FONT_CANDIDATES)
-    log.info("Caption font: %s", bold_font or "PIL default")
+    emoji_font = _find_font(_EMOJI_FONT_CANDIDATES)
+    log.info("Caption bold font: %s", bold_font or "PIL default")
+    log.info("Caption emoji font: %s", emoji_font or "PIL default")
 
     with tempfile.TemporaryDirectory() as tmp:
 
@@ -316,7 +355,7 @@ async def render_short(
 
             # ── Pre-render caption PNGs via Pillow ─────────────────────────
             overlays = make_caption_overlays(
-                scene["text"], duration, bold_font, tmp, num
+                scene["text"], duration, bold_font, emoji_font, tmp, num
             )
 
             # ── Build FFmpeg command ────────────────────────────────────────
@@ -325,9 +364,9 @@ async def render_short(
                 "-stream_loop", "-1", "-i", raw_path,
             ]
 
-            # Add each caption PNG as an input
+            # Add each caption PNG as a looped 30fps input stream
             for png_path, _, _ in overlays:
-                base_cmd += ["-i", png_path]
+                base_cmd += ["-loop", "1", "-framerate", "30", "-i", png_path]
 
             scale_filter = (
                 "[0:v]"
