@@ -32,10 +32,10 @@ VOICE OPTIONS:
   Full list: edge-tts --list-voices
 """
 
+import asyncio
 import io
 import os
 import shutil
-import subprocess
 import tempfile
 import textwrap
 
@@ -99,11 +99,19 @@ async def render(
     out_path = os.path.join(tmp, "out.mp4")
     cap_path = os.path.join(tmp, "caption.txt")
 
-    # Write uploaded files to temp directory
+    # Write uploaded files — cap video at 100 MB to avoid OOM on free tier
+    video_bytes = await video.read()
+    if len(video_bytes) > 100 * 1024 * 1024:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise HTTPException(413, "Background video must be under 100 MB")
     with open(bg_path, "wb") as f:
-        f.write(await video.read())
+        f.write(video_bytes)
+    del video_bytes  # free RAM immediately
+
+    audio_bytes = await audio.read()
     with open(voice_path, "wb") as f:
-        f.write(await audio.read())
+        f.write(audio_bytes)
+    del audio_bytes
 
     # Wrap caption text to ~28 chars per line so it fits 1080px width at 54pt
     display_text = caption.strip() or title.strip() or "Watch till the end!"
@@ -112,7 +120,7 @@ async def render(
         f.write(wrapped)
 
     # Build FFmpeg video-filter chain:
-    #   1. Scale so shortest side ≥ 1080×1920, then centre-crop to exact size
+    #   1. Scale so shortest side >= 1080x1920, then centre-crop to exact size
     #   2. Draw caption text near the bottom with a translucent backing box
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -124,24 +132,35 @@ async def render(
 
     cmd = [
         "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", bg_path,   # loop background if shorter than audio
+        "-stream_loop", "-1", "-i", bg_path,
         "-i", voice_path,
         "-vf", vf,
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-shortest",                             # stop when voiceover ends
-        "-r", "30", "-movflags", "+faststart",
+        # ultrafast = lowest RAM/CPU; free Render tier has only 512 MB
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        "-r", "30",
+        "-threads", "1",          # single thread keeps RSS well under 512 MB
+        "-movflags", "+faststart",
+        "-fs", "80M",             # hard cap output at 80 MB — prevents runaway
         out_path,
     ]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # Use async subprocess so uvicorn event loop stays alive during encoding
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr_bytes = await proc.communicate()
+
     if proc.returncode != 0:
-        # Clean up on failure before raising
         shutil.rmtree(tmp, ignore_errors=True)
         raise HTTPException(
             status_code=500,
-            detail=f"FFmpeg failed:\n{proc.stderr[-2000:]}",
+            detail=f"FFmpeg failed:\n{stderr_bytes.decode()[-2000:]}",
         )
 
     # Stream the file back and delete the temp dir afterwards
