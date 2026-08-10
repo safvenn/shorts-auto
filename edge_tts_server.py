@@ -157,10 +157,11 @@ def caption_drawtext_filters(
         t_end   = round((i + 1) * chunk_dur, 6)
         label   = _emoji_for_chunk(chunk)
 
-        # enable: (t>=X)*(t<Y) — pure operators, ZERO commas anywhere.
-        # between(t,X,Y) and gte(t,X) both contain commas that FFmpeg 7.x
-        # incorrectly splits as filter-chain separators in the -vf string.
-        enable = f"'(t>={t_start})*(t<{t_end})'"
+        # enable: gte(t\,X)*lt(t\,Y) — means (t >= X) AND (t < Y)
+        # FFmpeg AVExpr has NO infix >= or < operators — must use gte()/lt().
+        # \, escapes the comma so the filter-chain parser treats it literally,
+        # not as a filter separator. No single-quote quoting needed.
+        enable = f"gte(t\\,{t_start})*lt(t\\,{t_end})"
 
         # Shadow pass (offset +4px, dark semi-transparent)
         shadow = (
