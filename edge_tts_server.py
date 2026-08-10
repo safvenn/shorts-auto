@@ -89,20 +89,24 @@ app = FastAPI(title="Shorts Auto", version="2.1.0")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def wrap_caption(text: str, width: int = 28) -> str:
-    """Break caption into short lines; \\N is FFmpeg drawtext's forced newline."""
-    return r"\N".join(textwrap.wrap(text, width=width))
+def prepare_caption(text: str, width: int = 28) -> str:
+    """
+    Wrap text into short lines and escape for FFmpeg drawtext.
 
-
-def escape_drawtext(text: str) -> str:
-    """Escape characters that break the FFmpeg drawtext filter value."""
-    return (
-        text
-        .replace("\\", r"\\")
+    Escaping is applied to each line BEFORE joining with \\N so the
+    newline marker is never double-escaped by the backslash replacement.
+    """
+    lines = textwrap.wrap(text, width=width) or [text]
+    escaped = [
+        line
+        .replace("\\", r"\\")   # must be first
         .replace("'",  r"\'")
         .replace(":",  r"\:")
         .replace("%",  r"\%")
-    )
+        for line in lines
+    ]
+    return r"\N".join(escaped)   # \N = FFmpeg drawtext forced newline
+
 
 
 def run_ffmpeg(cmd: list[str], label: str) -> tuple[bool, str]:
@@ -174,7 +178,7 @@ async def render_short(
         for scene in sorted(scene_data, key=lambda s: s["sceneNumber"]):
             num      = scene["sceneNumber"]
             duration = float(scene["durationSeconds"])
-            caption  = escape_drawtext(wrap_caption(scene["text"]))
+            caption  = prepare_caption(scene["text"])
             log.info("Scene %d | duration=%.1fs | caption=%r", num, duration, caption)
 
             # Read → write → del: never hold more than one clip in RAM at once
