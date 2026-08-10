@@ -375,17 +375,18 @@ async def render_short(
             )
 
             # ── Build FFmpeg command ────────────────────────────────────────
-            # If captions exist, feed video (#0) + caps concat stream (#1)
-            # Uses 1 single overlay filter for zero lag and minimal RAM
+            # -t on the INPUT side reliably stops the stream_loop after
+            # exactly `duration` seconds (output -t can race with filters).
+            # eof_action=pass: when the PNG concat stream finishes, let the
+            # base video keep flowing instead of killing the overlay output.
             if concat_txt_path:
                 ok, stderr = run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-i", raw_path,
+                    "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
                     "-f", "concat", "-safe", "0", "-i", concat_txt_path,
-                    "-t", str(duration),
                     "-filter_complex", (
                         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base];"
-                        f"[base][1:v]overlay=x=(W-w)/2:y=H-h-{CAPTION_BOTTOM_PAD}[vout]"
+                        f"[base][1:v]overlay=x=(W-w)/2:y=H-h-{CAPTION_BOTTOM_PAD}:eof_action=pass[vout]"
                     ),
                     "-map", "[vout]",
                     "-an",
@@ -402,8 +403,7 @@ async def render_short(
             else:
                 ok, stderr = run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-i", raw_path,
-                    "-t", str(duration),
+                    "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
                     "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
                     "-an",
                     "-c:v", "libx264",
