@@ -216,14 +216,14 @@ def caption_drawtext_filters(
         # Bounce frame: oversized pop
         filters.append(
             f"drawtext=text='{escaped}'"
-            f":enable='{enable_bounce}'"
+            f":enable={enable_bounce}"
             f":fontsize={CAPTION_BOUNCE_SIZE}"
             + common_style
         )
         # Normal frame
         filters.append(
             f"drawtext=text='{escaped}'"
-            f":enable='{enable_normal}'"
+            f":enable={enable_normal}"
             f":fontsize={CAPTION_FONTSIZE}"
             + common_style
         )
