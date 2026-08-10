@@ -32,33 +32,23 @@ VOICE OPTIONS:
   Full list: edge-tts --list-voices
 """
 
-import asyncio
 import io
 import os
-import shutil
+import subprocess
 import tempfile
 import textwrap
 
 import edge_tts
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Form, Response, UploadFile
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 
 app = FastAPI(title="Shorts Auto", version="2.0.0")
 
-# Path to DejaVu Bold font – present when the Docker image installs fonts-dejavu-core
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-
-def _esc(text: str) -> str:
-    """Escape characters that break ffmpeg drawtext filter values."""
-    return (
-        text.replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\u2019")   # curly apostrophe – safe in drawtext
-            .replace("%", "\\%")
-    )
+def wrap_caption(text: str, width: int = 28) -> str:
+    """Break caption into short lines so it fits a 1080px-wide vertical video."""
+    lines = textwrap.wrap(text, width=width)
+    return r"\N".join(lines)  # \N = forced newline inside FFmpeg drawtext
 
 
 class TTSRequest(BaseModel):
@@ -80,96 +70,57 @@ async def generate_speech(req: TTSRequest):
 
 
 @app.post("/render")
-async def render(
-    audio: UploadFile = File(..., description="Voiceover MP3 from /tts"),
-    video: UploadFile = File(..., description="Background footage clip"),
-    title: str = Form("", description="Short title (used if caption is empty)"),
-    caption: str = Form("", description="Caption text to overlay on the video"),
+async def render_short(
+    audio: UploadFile,
+    video: UploadFile,
+    caption: str = Form(""),
 ):
-    """
-    Stitch voiceover audio + background video into a 1080×1920 YouTube Short.
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "audio.mp3")
+        video_path = os.path.join(tmp, "video.mp4")
+        output_path = os.path.join(tmp, "output.mp4")
 
-    The background is looped/cropped to fill the vertical frame, the caption
-    is drawn at the bottom with a semi-transparent box, and the output is
-    trimmed to the length of the voiceover audio.
-    """
-    tmp = tempfile.mkdtemp()
-    bg_path = os.path.join(tmp, "bg.mp4")
-    voice_path = os.path.join(tmp, "voice.mp3")
-    out_path = os.path.join(tmp, "out.mp4")
-    cap_path = os.path.join(tmp, "caption.txt")
+        with open(audio_path, "wb") as f:
+            f.write(await audio.read())
+        with open(video_path, "wb") as f:
+            f.write(await video.read())
 
-    # Write uploaded files — cap video at 100 MB to avoid OOM on free tier
-    video_bytes = await video.read()
-    if len(video_bytes) > 100 * 1024 * 1024:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise HTTPException(413, "Background video must be under 100 MB")
-    with open(bg_path, "wb") as f:
-        f.write(video_bytes)
-    del video_bytes  # free RAM immediately
+        caption_text = wrap_caption(caption).replace("'", r"\'").replace(":", r"\:")
 
-    audio_bytes = await audio.read()
-    with open(voice_path, "wb") as f:
-        f.write(audio_bytes)
-    del audio_bytes
-
-    # Wrap caption text to ~28 chars per line so it fits 1080px width at 54pt
-    display_text = caption.strip() or title.strip() or "Watch till the end!"
-    wrapped = "\n".join(textwrap.wrap(_esc(display_text), width=28))
-    with open(cap_path, "w", encoding="utf-8") as f:
-        f.write(wrapped)
-
-    # Build FFmpeg video-filter chain:
-    #   1. Scale so shortest side >= 1080x1920, then centre-crop to exact size
-    #   2. Draw caption text near the bottom with a translucent backing box
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        f"drawtext=fontfile={FONT}:textfile={cap_path}:reload=0:"
-        "fontcolor=white:fontsize=54:line_spacing=12:box=1:"
-        "boxcolor=black@0.5:boxborderw=24:x=(w-text_w)/2:y=h-text_h-260"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", bg_path,
-        "-i", voice_path,
-        "-vf", vf,
-        "-map", "0:v:0", "-map", "1:a:0",
-        # ultrafast = lowest RAM/CPU; free Render tier has only 512 MB
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
-        "-r", "30",
-        "-threads", "1",          # single thread keeps RSS well under 512 MB
-        "-movflags", "+faststart",
-        "-fs", "80M",             # hard cap output at 80 MB — prevents runaway
-        out_path,
-    ]
-
-    # Use async subprocess so uvicorn event loop stays alive during encoding
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr_bytes = await proc.communicate()
-
-    if proc.returncode != 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"FFmpeg failed:\n{stderr_bytes.decode()[-2000:]}",
+        # Build the filter: crop/scale footage to 1080x1920 vertical,
+        # loop it if shorter than audio, burn caption near the bottom,
+        # then mux with the voiceover track.
+        vf = (
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,"
+            f"drawtext=text='{caption_text}':fontcolor=white:fontsize=48:"
+            "borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-380:line_spacing=10"
         )
 
-    # Stream the file back and delete the temp dir afterwards
-    return FileResponse(
-        out_path,
-        media_type="video/mp4",
-        filename="short.mp4",
-        background=BackgroundTask(shutil.rmtree, tmp, True),
-    )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", video_path,   # loop background video
+            "-i", audio_path,                          # voiceover (sets duration)
+            "-vf", vf,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",                                # cut to audio length
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return Response(
+                content=f"FFmpeg failed:\n{result.stderr[-2000:]}",
+                media_type="text/plain",
+                status_code=500,
+            )
+
+        with open(output_path, "rb") as f:
+            video_bytes = f.read()
+
+        return Response(content=video_bytes, media_type="video/mp4")
 
 
 @app.get("/health")
