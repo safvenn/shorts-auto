@@ -149,11 +149,13 @@ def build_font_path() -> str:
     Priority: Impact → DejaVuSans-Bold → any DejaVu → empty (FFmpeg default).
     """
     candidates = [
-        "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
-        "/usr/share/fonts/truetype/impact.ttf",
-        "/usr/share/fonts/Impact.ttf",
+        # Liberation Sans Bold (installed via fonts-liberation)
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+        # DejaVu Bold (always present in our Docker image)
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        # Fallback
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     for path in candidates:

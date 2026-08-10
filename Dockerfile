@@ -9,16 +9,14 @@
 
 FROM python:3.11-slim
 
-# Install FFmpeg, DejaVu Bold (always available fallback), Impact via
-# msttcorefonts (accepted EULA automatically), and Noto Color Emoji for
-# full emoji rendering in FFmpeg drawtext captions.
+# Install FFmpeg, DejaVu Bold (bold caption fallback), Liberation fonts
+# (free Arial/Impact-like alternative), and Noto Color Emoji for emoji
+# rendering in FFmpeg drawtext captions.
 RUN apt-get update \
- && echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" \
-    | debconf-set-selections \
  && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-dejavu-core \
-        ttf-mscorefonts-installer \
+        fonts-liberation \
         fonts-noto-color-emoji \
  && fc-cache -fv \
  && rm -rf /var/lib/apt/lists/*
