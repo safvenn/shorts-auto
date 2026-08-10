@@ -136,7 +136,8 @@ def caption_drawtext_filters(
     - Yellow (#FFE600) bold text centred horizontally
     - Black border (bordercolor=black, borderw=5)
     - Positioned CAPTION_BOTTOM_PAD px from the bottom of the frame
-    - Each chunk shown for chunk_dur seconds via 'enable=between(t,...)'
+    - enable uses (t>=X)*(t<Y) — NO commas, avoids FFmpeg filter-chain split bug
+      (between(t,X,Y) contains commas that FFmpeg 7.x splits as filter separators)
     """
     words = text.split()
     if not words:
@@ -152,18 +153,23 @@ def caption_drawtext_filters(
     font_arg = f":fontfile={font_path}" if font_path else ""
 
     for i, chunk in enumerate(chunks):
-        t_start = round(i * chunk_dur, 4)
-        t_end   = round((i + 1) * chunk_dur, 4)
+        t_start = round(i * chunk_dur, 6)
+        t_end   = round((i + 1) * chunk_dur, 6)
         label   = _emoji_for_chunk(chunk)
 
-        # Shadow pass (offset by 4px, dark semi-transparent)
+        # enable: (t>=X)*(t<Y) — pure operators, ZERO commas anywhere.
+        # between(t,X,Y) and gte(t,X) both contain commas that FFmpeg 7.x
+        # incorrectly splits as filter-chain separators in the -vf string.
+        enable = f"'(t>={t_start})*(t<{t_end})'"
+
+        # Shadow pass (offset +4px, dark semi-transparent)
         shadow = (
             f"drawtext=text='{_esc(label)}'{font_arg}"
             f":fontsize={CAPTION_FONT_SIZE}"
             f":fontcolor=black@0.6"
             f":x=(w-text_w)/2+4:y=h-text_h-{CAPTION_BOTTOM_PAD}+4"
             f":borderw=0"
-            f":enable='between(t,{t_start},{t_end})'"
+            f":enable={enable}"
         )
         # Main text pass (yellow + black border)
         main = (
@@ -172,10 +178,10 @@ def caption_drawtext_filters(
             f":fontcolor=#FFE600"
             f":x=(w-text_w)/2:y=h-text_h-{CAPTION_BOTTOM_PAD}"
             f":bordercolor=black:borderw=5"
-            f":enable='between(t,{t_start},{t_end})'"
+            f":enable={enable}"
         )
         filters += [shadow, main]
-        log.info("Caption [%.3f-%.3f] %r", t_start, t_end, label)
+        log.info("Caption [%.4f-%.4f] %r", t_start, t_end, label)
 
     return filters
 
