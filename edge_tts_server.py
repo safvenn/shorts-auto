@@ -1,23 +1,23 @@
 """
-Free Edge-TTS + Render HTTP wrapper for n8n - v4 (Pillow captions + High Quality)
----------------------------------------------------------------------------------
+Free Edge-TTS + Render HTTP wrapper for n8n - v5 (drawtext captions, 4K-safe)
+-------------------------------------------------------------------------------
 Provides two endpoints:
   POST /tts    – generate MP3 voiceover via Microsoft Edge TTS (free, no key)
   POST /render – multi-scene render: 4 video clips + 1 voiceover + scenes JSON
                  → single vertical Short with:
-                   • Pillow-rendered caption PNGs (true color emoji, no FFmpeg drawtext)
-                   • Bold yellow text, thick black stroke, drop shadow
-                   • Auto emoji injection (keyword → 🔥💰⭐🏆⚡🧠😂😱🔑❤️)
-                   • 2-word chunks, zero-lag exact timing via FFmpeg overlay
-                   • Captions at lower-third (430px above bottom, below screen center)
-                   • High quality encode: CRF 18, fast preset, 4 Mbps cap
+                   • FFmpeg drawtext captions (single-stream, OOM-safe on 4K input)
+                   • Bold yellow text (#FFE600), thick black border, drop shadow
+                   • Auto emoji injection (keyword → 🔥💰★🏆⚡🧠😂😱🔑❤)
+                   • 2-word chunks, exact timing via enable='between(t,...)'
+                   • Captions at lower-third (430px above bottom)
+                   • CRF 23, ultrafast preset — safe on 512 MB AWS free-tier
 
 SETUP:
   Docker:
     docker build -t shorts-auto . && docker run -p 8000:8000 shorts-auto
 
   Local (TTS-only):
-    pip install fastapi uvicorn edge-tts python-multipart Pillow
+    pip install fastapi uvicorn edge-tts python-multipart
     python edge_tts_server.py
 
 USAGE:
@@ -36,7 +36,6 @@ import tempfile
 
 import edge_tts
 from fastapi import FastAPI, Form, Response, UploadFile
-from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -52,11 +51,11 @@ logging.basicConfig(
 log = logging.getLogger("render")
 
 # ── FFmpeg quality settings ───────────────────────────────────────────────────
-# CRF 18 = high quality (visually near-lossless).
-# preset fast = crisp encoding quality
-# 4 Mbps cap keeps file sizes sharp while reasonable
-PRESET       = "fast"
-CRF          = "18"
+# ultrafast + CRF 23: safe on 512 MB free-tier while decoding 4K input.
+# The encoder only touches the 1080×1920 scaled frame, not the 4K original,
+# so CRF 23 ultrafast still produces clean-looking vertical Shorts output.
+PRESET       = "ultrafast"
+CRF          = "23"
 THREADS      = "1"
 MAX_BITRATE  = "4000k"
 BUF_SIZE     = "8000k"
@@ -64,40 +63,31 @@ AUDIO_BR     = "128k"
 MAX_INPUT_MB = 80
 
 # ── Caption layout ────────────────────────────────────────────────────────────
-WORDS_PER_CHUNK      = 2      # 2 words per caption card
-VIDEO_W              = 1080
-VIDEO_H              = 1920
-CAPTION_FONT_SIZE    = 82     # large, punchy
-CAPTION_STROKE_W     = 5      # black border thickness (px)
-CAPTION_SHADOW_OFF   = 5      # drop shadow offset (px)
-CAPTION_BOTTOM_PAD   = 430    # px from bottom of frame to bottom of caption
-# CRITICAL: ALL caption PNGs must be EXACTLY this size.
-# The concat demuxer feeds them into one overlay filter; any size change
-# causes FFmpeg to "Reconfigure filter graph" and produce 0 frames.
-CAPTION_PNG_W        = VIDEO_W - 20   # 1060px — fixed width
-CAPTION_PNG_H        = 150            # fixed height (fits font+stroke+shadow)
+WORDS_PER_CHUNK   = 2     # words per caption card
+CAPTION_FONT_SIZE = 82    # drawtext fontsize
+CAPTION_BOTTOM_PAD= 430   # px from bottom of frame
 
-# ── Emoji keyword map ─────────────────────────────────────────────────────────
+# ── Emoji keyword map (appended as plain text after each chunk) ────────────────
+# drawtext renders these as monochrome glyphs or boxes — acceptable fallback.
 EMOJI_MAP: dict[str, str] = {
     "fire": "🔥", "hot": "🔥", "burn": "🔥", "heat": "🔥", "flame": "🔥",
     "money": "💰", "cash": "💰", "rich": "💰", "earn": "💰", "profit": "💰",
     "income": "💰", "dollar": "💰", "wealth": "💰",
-    "love": "❤️", "heart": "❤️", "care": "❤️", "feel": "❤️",
-    "star": "⭐", "best": "⭐", "amazing": "⭐", "great": "⭐", "awesome": "⭐",
-    "top": "⭐",
+    "love": "❤",  "heart": "❤",  "care": "❤",  "feel": "❤",
+    "star": "★",  "best": "★",   "amazing": "★", "great": "★", "awesome": "★",
+    "top": "★",
     "win": "🏆", "winner": "🏆", "victory": "🏆", "champion": "🏆",
     "succeed": "🏆", "success": "🏆",
     "fast": "⚡", "speed": "⚡", "quick": "⚡", "boost": "⚡", "power": "⚡",
     "mind": "🧠", "brain": "🧠", "think": "🧠", "smart": "🧠", "learn": "🧠",
     "secret": "🔑", "key": "🔑", "unlock": "🔑",
-    "laugh": "😂", "funny": "😂", "joke": "😂", "lol": "😂",
+    "laugh": "😂", "funny": "😂", "joke": "😂",
     "shock": "😱", "wow": "😱", "crazy": "😱", "insane": "😱", "wild": "😱",
-    "grow": "🚀", "growth": "🚀", "launch": "🚀", "go": "🚀", "start": "🚀",
-    "life": "🌟", "new": "🌟", "world": "🌍",
+    "grow": "🚀", "growth": "🚀", "launch": "🚀",
     "work": "💪", "grind": "💪", "hustle": "💪", "strong": "💪",
 }
 
-app = FastAPI(title="Shorts Auto", version="4.0.0")
+app = FastAPI(title="Shorts Auto", version="5.0.0")
 
 
 # ── Font helpers ──────────────────────────────────────────────────────────────
@@ -110,12 +100,6 @@ _BOLD_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 
-_EMOJI_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
-]
-
 
 def _find_font(candidates: list[str]) -> str:
     for p in candidates:
@@ -124,165 +108,76 @@ def _find_font(candidates: list[str]) -> str:
     return ""
 
 
-def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        if path:
-            return ImageFont.truetype(path, size)
-    except Exception:
-        pass
-    return ImageFont.load_default()
+# ── Caption via FFmpeg drawtext (single-stream, OOM-safe on 4K input) ─────────
+
+def _esc(text: str) -> str:
+    """Escape text for FFmpeg drawtext filter (colon, backslash, apostrophe)."""
+    return text.replace("\\", "\\\\").replace("'", "\\\\\\'").replace(":", "\\:")
 
 
-# ── Caption rendering (Pillow) ────────────────────────────────────────────────
-
-def emoji_for_chunk(chunk: str) -> tuple[str, str]:
-    """
-    Return (clean_chunk_text, emoji_str).
-    If a keyword matches, returns (chunk, emoji). Otherwise returns (chunk, "").
-    """
+def _emoji_for_chunk(chunk: str) -> str:
+    """Return chunk text + appended emoji char if a keyword matches."""
     for word in chunk.lower().split():
         clean = word.strip(".,!?;:")
         if clean in EMOJI_MAP:
-            return chunk, " " + EMOJI_MAP[clean]
-    return chunk, ""
+            return chunk + " " + EMOJI_MAP[clean]
+    return chunk
 
 
-def render_caption_png(
-    chunk_text: str,
-    emoji_str: str,
-    bold_font_path: str,
-    emoji_font_path: str,
-    font_size: int = CAPTION_FONT_SIZE,
-) -> Image.Image:
-    """
-    Render caption as a FIXED-SIZE (CAPTION_PNG_W x CAPTION_PNG_H) transparent RGBA PNG.
-
-    IMPORTANT: Fixed size is critical — the concat demuxer feeds all caption PNGs
-    into a single overlay filter. If any PNG differs in size, FFmpeg reconfigures
-    the filter graph and produces 0 output frames (silent crash).
-
-    All text/emoji is centered in this fixed canvas.
-    """
-    bold_font  = _load_font(bold_font_path, font_size)
-    emoji_font = _load_font(emoji_font_path, font_size) if emoji_font_path else None
-
-    # ── Fixed canvas — MUST match CAPTION_PNG_W × CAPTION_PNG_H exactly ──────
-    img  = Image.new("RGBA", (CAPTION_PNG_W, CAPTION_PNG_H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # Measure text on a probe canvas
-    probe      = Image.new("RGBA", (CAPTION_PNG_W * 2, CAPTION_PNG_H * 4), (0, 0, 0, 0))
-    probe_draw = ImageDraw.Draw(probe)
-
-    bbox_text = probe_draw.textbbox(
-        (0, 0), chunk_text, font=bold_font, stroke_width=CAPTION_STROKE_W
-    )
-    text_w = bbox_text[2] - bbox_text[0]
-    text_h = bbox_text[3] - bbox_text[1]
-
-    # Measure emoji width if present
-    emoji_w = 0
-    ef = emoji_font if emoji_font else bold_font
-    if emoji_str:
-        bbox_em = probe_draw.textbbox((0, 0), emoji_str, font=ef)
-        emoji_w = bbox_em[2] - bbox_em[0] + 8  # 8px gap
-
-    total_w = text_w + emoji_w
-
-    # Center the whole group horizontally, center text vertically
-    x = (CAPTION_PNG_W - total_w) // 2 - bbox_text[0]
-    y = (CAPTION_PNG_H - text_h) // 2 - bbox_text[1]
-
-    # 1. Drop shadow
-    draw.text(
-        (x + CAPTION_SHADOW_OFF, y + CAPTION_SHADOW_OFF),
-        chunk_text, font=bold_font, fill=(0, 0, 0, 170),
-    )
-
-    # 2. Main text (yellow with black stroke)
-    draw.text(
-        (x, y), chunk_text, font=bold_font,
-        fill=(255, 230, 0, 255),
-        stroke_width=CAPTION_STROKE_W,
-        stroke_fill=(0, 0, 0, 255),
-    )
-
-    # 3. Emoji (right of text)
-    if emoji_str:
-        x_emoji = x + text_w + bbox_text[0] + 8
-        try:
-            if emoji_font:
-                draw.text((x_emoji, y), emoji_str, font=ef, embedded_color=True)
-            else:
-                draw.text(
-                    (x_emoji, y), emoji_str, font=ef,
-                    fill=(255, 230, 0, 255),
-                    stroke_width=CAPTION_STROKE_W,
-                    stroke_fill=(0, 0, 0, 255),
-                )
-        except Exception:
-            draw.text(
-                (x_emoji, y), emoji_str, font=bold_font,
-                fill=(255, 230, 0, 255),
-                stroke_width=CAPTION_STROKE_W,
-                stroke_fill=(0, 0, 0, 255),
-            )
-
-    return img
-
-
-def make_caption_overlays(
+def caption_drawtext_filters(
     text: str,
     duration: float,
-    bold_font_path: str,
-    emoji_font_path: str,
-    tmp_dir: str,
-    scene_num: int,
-) -> tuple[str, list[str]]:
+    font_path: str,
+) -> list[str]:
     """
-    Pre-render each 2-word chunk as a PNG, save to tmp_dir, and generate caps.txt
-    for the FFmpeg concat demuxer.
-    Returns (concat_txt_path, list_of_png_paths). Zero-lag, exact timing.
+    Build a list of FFmpeg drawtext filter strings — one per 2-word caption chunk.
+
+    Styling:
+    - Yellow (#FFE600) bold text centred horizontally
+    - Black border (bordercolor=black, borderw=5)
+    - Positioned CAPTION_BOTTOM_PAD px from the bottom of the frame
+    - Each chunk shown for chunk_dur seconds via 'enable=between(t,...)'
     """
     words = text.split()
     if not words:
-        return "", []
+        return []
 
     chunks = [
         " ".join(words[i: i + WORDS_PER_CHUNK])
         for i in range(0, len(words), WORDS_PER_CHUNK)
     ]
     chunk_dur = duration / max(len(chunks), 1)
-    png_paths: list[str] = []
+    filters   = []
+
+    font_arg = f":fontfile={font_path}" if font_path else ""
 
     for i, chunk in enumerate(chunks):
-        t_start = i * chunk_dur
-        t_end   = (i + 1) * chunk_dur
+        t_start = round(i * chunk_dur, 4)
+        t_end   = round((i + 1) * chunk_dur, 4)
+        label   = _emoji_for_chunk(chunk)
 
-        clean_chunk, emoji_str = emoji_for_chunk(chunk)
-        img = render_caption_png(clean_chunk, emoji_str, bold_font_path, emoji_font_path)
-        png_path = os.path.join(tmp_dir, f"cap_s{scene_num}_{i:03d}.png")
-        img.save(png_path, "PNG")
-        png_paths.append(png_path)
-        log.info(
-            "Cap PNG s%d[%d] '%s%s' [%.3f,%.3f] size=%dx%d",
-            scene_num, i, clean_chunk, emoji_str, t_start, t_end, img.width, img.height,
+        # Shadow pass (offset by 4px, dark semi-transparent)
+        shadow = (
+            f"drawtext=text='{_esc(label)}'{font_arg}"
+            f":fontsize={CAPTION_FONT_SIZE}"
+            f":fontcolor=black@0.6"
+            f":x=(w-text_w)/2+4:y=h-text_h-{CAPTION_BOTTOM_PAD}+4"
+            f":borderw=0"
+            f":enable='between(t,{t_start},{t_end})'"
         )
+        # Main text pass (yellow + black border)
+        main = (
+            f"drawtext=text='{_esc(label)}'{font_arg}"
+            f":fontsize={CAPTION_FONT_SIZE}"
+            f":fontcolor=#FFE600"
+            f":x=(w-text_w)/2:y=h-text_h-{CAPTION_BOTTOM_PAD}"
+            f":bordercolor=black:borderw=5"
+            f":enable='between(t,{t_start},{t_end})'"
+        )
+        filters += [shadow, main]
+        log.info("Caption [%.3f-%.3f] %r", t_start, t_end, label)
 
-    if not png_paths:
-        return "", []
-
-    concat_txt_path = os.path.join(tmp_dir, f"caps_s{scene_num}.txt")
-    with open(concat_txt_path, "w", encoding="utf-8") as f:
-        for p in png_paths:
-            normalized_path = p.replace("\\", "/")
-            f.write(f"file '{normalized_path}'\n")
-            f.write(f"duration {chunk_dur:.4f}\n")
-        # FFmpeg concat demuxer requirement: repeat last entry
-        normalized_last = png_paths[-1].replace("\\", "/")
-        f.write(f"file '{normalized_last}'\n")
-
-    return concat_txt_path, png_paths
+    return filters
 
 
 # ── FFmpeg wrapper ────────────────────────────────────────────────────────────
@@ -324,13 +219,11 @@ async def render_short(
     video4: UploadFile,
     scenes: str = Form(...),
 ):
-    log.info("Render request received (v4 Pillow captions + Concat Demuxer + High Quality)")
+    log.info("Render request received (v5 drawtext captions, single-stream, 4K-safe)")
     scene_data = json.loads(scenes)
     uploads    = {1: video1, 2: video2, 3: video3, 4: video4}
     bold_font  = _find_font(_BOLD_FONT_CANDIDATES)
-    emoji_font = _find_font(_EMOJI_FONT_CANDIDATES)
-    log.info("Caption bold font: %s", bold_font or "PIL default")
-    log.info("Caption emoji font: %s", emoji_font or "PIL default")
+    log.info("Caption font: %s", bold_font or "(system default)")
 
     with tempfile.TemporaryDirectory() as tmp:
 
@@ -369,63 +262,33 @@ async def render_short(
 
             clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
-            # ── Pre-render caption PNGs & concat.txt via Pillow ─────────────
-            concat_txt_path, png_paths = make_caption_overlays(
-                scene["text"], duration, bold_font, emoji_font, tmp, num
+            # ── Build -vf chain: scale + crop + drawtext captions ───────────
+            # Single-stream approach: decode 4K → scale to 1080p → draw text.
+            # No second stream = no overlay filter = no OOM on 512 MB RAM.
+            cap_filters = caption_drawtext_filters(scene["text"], duration, bold_font)
+            vf_chain = ",".join(
+                ["scale=1080:1920:force_original_aspect_ratio=increase", "crop=1080:1920"]
+                + cap_filters
             )
 
-            # ── Build FFmpeg command ────────────────────────────────────────
-            # -t on the INPUT side reliably stops the stream_loop after
-            # exactly `duration` seconds (output -t can race with filters).
-            # eof_action=pass: when the PNG concat stream finishes, let the
-            # base video keep flowing instead of killing the overlay output.
-            if concat_txt_path:
-                ok, stderr = run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
-                    "-f", "concat", "-safe", "0", "-i", concat_txt_path,
-                    "-filter_complex", (
-                        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base];"
-                        f"[base][1:v]overlay=x=(W-w)/2:y=H-h-{CAPTION_BOTTOM_PAD}:eof_action=pass[vout]"
-                    ),
-                    "-map", "[vout]",
-                    "-an",
-                    "-c:v", "libx264",
-                    "-preset", PRESET,
-                    "-crf", CRF,
-                    "-maxrate", MAX_BITRATE,
-                    "-bufsize", BUF_SIZE,
-                    "-threads", THREADS,
-                    "-r", "30",
-                    "-pix_fmt", "yuv420p",
-                    clip_path,
-                ], label=f"scene{num}")
-            else:
-                ok, stderr = run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                    "-an",
-                    "-c:v", "libx264",
-                    "-preset", PRESET,
-                    "-crf", CRF,
-                    "-maxrate", MAX_BITRATE,
-                    "-bufsize", BUF_SIZE,
-                    "-threads", THREADS,
-                    "-r", "30",
-                    "-pix_fmt", "yuv420p",
-                    clip_path,
-                ], label=f"scene{num}")
+            ok, stderr = run_ffmpeg([
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
+                "-vf", vf_chain,
+                "-an",
+                "-c:v", "libx264",
+                "-preset", PRESET,
+                "-crf", CRF,
+                "-maxrate", MAX_BITRATE,
+                "-bufsize", BUF_SIZE,
+                "-threads", THREADS,
+                "-r", "30",
+                "-pix_fmt", "yuv420p",
+                clip_path,
+            ], label=f"scene{num}")
 
-            # Clean up raw + caption files
+            # Clean up raw video immediately to free disk space
             os.remove(raw_path)
-            if concat_txt_path and os.path.exists(concat_txt_path):
-                os.remove(concat_txt_path)
-            for png_path in png_paths:
-                try:
-                    os.remove(png_path)
-                except OSError:
-                    pass
 
             if not ok:
                 return Response(
