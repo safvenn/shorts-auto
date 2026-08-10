@@ -11,13 +11,26 @@ FROM python:3.11-slim
 
 # Install FFmpeg, DejaVu Bold (bold caption fallback), Liberation fonts
 # (free Arial/Impact-like alternative), and Noto Color Emoji for emoji
-# rendering in FFmpeg drawtext captions.
+# rendering in FFmpeg drawtext captions. Also fetch Montserrat/Poppins
+# ExtraBold — free (OFL-licensed) fonts that match the look most modern
+# YouTube Shorts / TikTok caption tools (CapCut, Submagic, Opus Clip) use.
+# The `|| true` on each download means a network hiccup or a moved file at
+# build time can't break the build — build_font_path() in the app falls
+# back through DejaVu/Liberation automatically if these aren't present.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-dejavu-core \
         fonts-liberation \
         fonts-noto-color-emoji \
+        curl \
+ && mkdir -p /usr/share/fonts/truetype/shorts \
+ && curl -fsSL -o /usr/share/fonts/truetype/shorts/Montserrat-ExtraBold.ttf \
+        https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-ExtraBold.ttf || true \
+ && curl -fsSL -o /usr/share/fonts/truetype/shorts/Poppins-ExtraBold.ttf \
+        https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-ExtraBold.ttf || true \
+ && find /usr/share/fonts/truetype/shorts -size -10k -delete \
+ && apt-get purge -y --auto-remove curl \
  && fc-cache -fv \
  && rm -rf /var/lib/apt/lists/*
 

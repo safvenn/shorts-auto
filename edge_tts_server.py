@@ -1,43 +1,86 @@
 """
-Free Edge-TTS + Render HTTP wrapper for n8n - v6 (Pillow captions, 2-pass, 4K-safe)
--------------------------------------------------------------------------------------
+Free Edge-TTS + Render HTTP wrapper for n8n - v4 (word-accurate captions)
+---------------------------------------------------------------------------
 Provides two endpoints:
-  POST /tts    – generate MP3 voiceover via Microsoft Edge TTS (free, no key)
+  POST /tts    – generate MP3 voiceover via Microsoft Edge TTS (free, no key),
+                 PLUS real per-word timing (from Edge TTS's own WordBoundary
+                 events) returned in the `X-Word-Timings` response header.
   POST /render – multi-scene render: 4 video clips + 1 voiceover + scenes JSON
-                 → single vertical Short with:
-                   • Pillow-rendered caption PNGs (true color emoji, exact timing)
-                   • Bold yellow text, thick black stroke, drop shadow
+                 (+ optional wordTimings JSON) → single vertical Short with:
+                   • Modern "karaoke" captions: white text, one short line of
+                     up to 4 words on screen, the CURRENTLY-SPOKEN word lit
+                     up in bright yellow — the same look used by CapCut,
+                     Submagic, Opus Clip and most viral Shorts/Reels today.
+                   • Captions centered mid-screen (clear of TikTok/IG/YouTube
+                     UI chrome at the very top and bottom).
+                   • Pixel-accurate word spacing, measured with the exact
+                     caption font via Pillow (no more guessed widths).
+                   • Word-accurate timing: if the caller forwards the
+                     `wordTimings` produced by /tts, each word lights up at
+                     the exact millisecond it's actually spoken. Falls back
+                     to even spacing across the scene if not provided.
                    • Auto emoji injection (keyword → 🔥💰⭐🏆⚡🧠😂😱🔑❤️)
-                   • 2-word chunks, accurate timing via FFmpeg concat demuxer
-                   • Captions lower-third (430 px above bottom)
                    • Cinema vignette overlay per scene
-                   • Two-pass per scene: 4K → 1080p (Pass 1), then caption overlay (Pass 2)
-                     This keeps RAM under 400 MB on AWS free tier even with 4K input.
 
 SETUP:
-  Docker:
+  Docker (recommended for /render – FFmpeg required):
     docker build -t shorts-auto . && docker run -p 8000:8000 shorts-auto
 
+  Local (TTS-only, no FFmpeg):
+    pip install fastapi uvicorn edge-tts python-multipart pillow
+    python edge_tts_server.py
+
 USAGE:
-  POST /tts   { "text": "...", "voice": "en-US-GuyNeural" }  → MP3
+  POST /tts
+    Body (JSON): { "text": "...", "voice": "en-US-GuyNeural" }
+    Returns: MP3 audio bytes
+    Header:  X-Word-Timings – base64 JSON array of [word, startSeconds,
+             endSeconds] triples, timed against the returned audio.
+             Forward this whole header value straight through as the
+             `wordTimings` form field on /render for word-accurate captions.
+
   POST /render  (multipart/form-data)
-    audio, video1-4, scenes JSON  → MP4
+    Fields:
+      audio        – binary  full voiceover track (matches the full script)
+      video1..4    – binary  scene 1-4 footage
+      scenes       – text    JSON: [{"sceneNumber":1,"text":"...","durationSeconds":7}, ...]
+      wordTimings  – text    OPTIONAL. Base64 JSON array of [word,start,end]
+                     (in seconds, relative to the full `audio` track) as
+                     returned in /tts's `X-Word-Timings` header. Omit to fall
+                     back to even per-word spacing within each scene.
+    Returns: MP4 video
+
+VOICE OPTIONS:
+  en-US-GuyNeural   – male, US, conversational
+  en-US-JennyNeural – female, US, warm
+  en-US-AriaNeural  – female, US, expressive
+  en-GB-RyanNeural  – male, British
+  en-GB-SoniaNeural – female, British
+  Full list: edge-tts --list-voices
+
+FREE-TIER LIMITS:
+  Render free tier: 512 MB RAM, shared CPU, 100 GB bandwidth/month.
+  FFmpeg settings here are tuned to stay well within that envelope.
+  Each input video is capped at 80 MB. Output is capped at ~60 MB.
+  Errors are logged to /tmp/render_errors.log for post-mortem diagnosis.
 """
 
+import base64
 import gc
 import io
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
 import edge_tts
 from fastapi import FastAPI, Form, Response, UploadFile
-from PIL import Image, ImageDraw, ImageFont
+from PIL import ImageFont
 from pydantic import BaseModel
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────
 LOG_FILE = "/tmp/render_errors.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -49,29 +92,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("render")
 
-# ── FFmpeg quality settings ───────────────────────────────────────────────────
-# Pass 1 (4K → 1080p prescale): ultrafast + CRF 30 = tiny intermediate file
-# Pass 2 (caption overlay on 1080p): ultrafast + CRF 23 = decent final quality
-PRESET_SCALE   = "ultrafast"
-CRF_SCALE      = "30"
-PRESET_CAPTION = "ultrafast"
-CRF_CAPTION    = "23"
-THREADS        = "1"
-MAX_BITRATE    = "4000k"
-BUF_SIZE       = "8000k"
-AUDIO_BR       = "96k"
-MAX_INPUT_MB   = 80
+# ── FFmpeg free-tier constants ────────────────────────────────────────────────
+PRESET       = "ultrafast"
+CRF          = "28"
+THREADS      = "1"
+MAX_BITRATE  = "900k"
+BUF_SIZE     = "1800k"
+AUDIO_BR     = "96k"
+MAX_INPUT_MB = 80
 
-# ── Caption layout ────────────────────────────────────────────────────────────
-WORDS_PER_CHUNK  = 2     # words shown at once
-CAPTION_FONT_SIZE = 82   # Pillow font size (px)
-CAPTION_STROKE_W  = 5    # black border thickness
-CAPTION_SHADOW_OFF = 5   # drop shadow offset
-CAPTION_BOTTOM_PAD = 430 # px from bottom of 1920px frame
-# ALL PNGs MUST be this exact size — the concat demuxer feeds one overlay filter;
-# any dimension change forces FFmpeg to reconfigure the filter graph → crash.
-CAPTION_PNG_W  = 1060    # fixed canvas width
-CAPTION_PNG_H  = 160     # fixed canvas height (fits 82px font + stroke + shadow)
+FRAME_W, FRAME_H = 1080, 1920
+
+# ── Caption style constants (standard modern Shorts/TikTok "karaoke" look) ──
+WORDS_PER_LINE     = 4          # soft cap on words per line, like CapCut/Submagic defaults
+CAPTION_FONTSIZE   = 84         # big, legible on a phone screen
+CAPTION_Y_RATIO    = 0.52       # vertical center-ish — clear of top/bottom app UI
+CAPTION_STROKE_W   = 12         # thick black outline, standard for readability
+WORD_GAP_PX        = 20         # gap between words on the same line
+SIDE_MARGIN_PX     = 48         # minimum margin kept clear on each side
+MAX_LINE_WIDTH_PX  = FRAME_W - 2 * SIDE_MARGIN_PX  # hard cap — lines never overflow the frame
+BASE_WORD_COLOR    = "white"
+ACTIVE_WORD_COLOR  = "0xFFE600" # bright yellow — the word being spoken right now
+
+# Cycle of xfade transition names (FFmpeg built-ins) — currently unused (see
+# render_short: concat uses stream-copy for RAM safety) but kept for future use.
+TRANSITIONS = ["fade", "slideleft", "wipeleft", "zoomin"]
 
 # ── Emoji keyword map ─────────────────────────────────────────────────────────
 EMOJI_MAP: dict[str, str] = {
@@ -93,45 +138,30 @@ EMOJI_MAP: dict[str, str] = {
     "work": "💪", "grind": "💪", "hustle": "💪", "strong": "💪",
 }
 
-app = FastAPI(title="Shorts Auto", version="6.0.0")
+app = FastAPI(title="Shorts Auto", version="4.0.0")
 
 
-# ── Font helpers ───────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-_BOLD_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
-_EMOJI_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
-]
+def escape_drawtext(text: str) -> str:
+    """Escape a string for safe use inside FFmpeg drawtext text='' value."""
+    return (
+        text
+        .replace("\\", r"\\")   # must be first
+        .replace("'",  r"\'")
+        .replace(":",  r"\:")
+        .replace(",",  r"\,")
+        .replace("%",  r"\%")
+    )
 
 
-def _find_font(candidates: list[str]) -> str:
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return ""
+def clean_word(word: str) -> str:
+    """Strip stray leading/trailing commas, periods, and whitespace."""
+    return re.sub(r"^[,.\s]+|[,.\s]+$", "", word)
 
-
-def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    try:
-        if path:
-            return ImageFont.truetype(path, size)
-    except Exception:
-        pass
-    return ImageFont.load_default()
-
-
-# ── Emoji lookup ───────────────────────────────────────────────────────────────
 
 def emoji_for_chunk(chunk: str) -> str:
-    """Return an emoji string to append to chunk, or '' if no match."""
+    """Return a single emoji for a line of text based on keyword lookup, or ''."""
     for word in chunk.lower().split():
         clean = word.strip(".,!?;:")
         if clean in EMOJI_MAP:
@@ -139,151 +169,267 @@ def emoji_for_chunk(chunk: str) -> str:
     return ""
 
 
-# ── Pillow caption rendering ──────────────────────────────────────────────────
-
-def render_caption_png(
-    text: str,
-    bold_font_path: str,
-    emoji_font_path: str,
-) -> Image.Image:
+def build_font_path() -> str:
     """
-    Render a caption as a fixed-size (CAPTION_PNG_W × CAPTION_PNG_H) transparent
-    RGBA PNG using Pillow.
-
-    CRITICAL: All PNGs must be EXACTLY CAPTION_PNG_W × CAPTION_PNG_H.
-    The FFmpeg concat demuxer feeds them into a single overlay filter; any size
-    change triggers "Reconfiguring filter graph" → 0 output frames.
-
-    Text + emoji are horizontally centered, vertically centered in the canvas.
+    Return the best available bold font path on the system.
+    Priority: Montserrat ExtraBold / Poppins ExtraBold (authentic Shorts-caption
+    look, installed at build time) → DejaVuSans-Bold → Liberation Bold → "".
     """
-    bold_font  = _load_font(bold_font_path, CAPTION_FONT_SIZE)
-    emoji_font = _load_font(emoji_font_path, CAPTION_FONT_SIZE) if emoji_font_path else None
+    candidates = [
+        "/usr/share/fonts/truetype/shorts/Montserrat-ExtraBold.ttf",
+        "/usr/share/fonts/truetype/shorts/Poppins-ExtraBold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            log.info("Caption font: %s", path)
+            return path
+    log.warning("No preferred font found; FFmpeg will use its default.")
+    return ""
 
-    # Append emoji based on keywords
-    emoji_str = emoji_for_chunk(text)
-    label = text + emoji_str      # full caption string (text + optional emoji)
 
-    # ── Fixed canvas ──────────────────────────────────────────────────────────
-    img  = Image.new("RGBA", (CAPTION_PNG_W, CAPTION_PNG_H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+_PIL_FONT_CACHE: dict[tuple[str, int], "ImageFont.FreeTypeFont"] = {}
 
-    # Measure on probe canvas to avoid clipping
-    probe      = Image.new("RGBA", (CAPTION_PNG_W * 2, CAPTION_PNG_H * 4), (0, 0, 0, 0))
-    probe_draw = ImageDraw.Draw(probe)
 
-    # Measure text portion
-    bbox_text = probe_draw.textbbox(
-        (0, 0), text, font=bold_font, stroke_width=CAPTION_STROKE_W
-    )
-    text_w = bbox_text[2] - bbox_text[0]
-    text_h = bbox_text[3] - bbox_text[1]
+def load_pil_font(font_path: str, size: int):
+    """Load (and cache) a Pillow font object for precise text measurement."""
+    key = (font_path, size)
+    if key in _PIL_FONT_CACHE:
+        return _PIL_FONT_CACHE[key]
+    try:
+        font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("Could not load font %s for measurement: %s", font_path, exc)
+        font = ImageFont.load_default()
+    _PIL_FONT_CACHE[key] = font
+    return font
 
-    # Measure emoji portion
-    emoji_w = 0
-    ef = emoji_font if emoji_font else bold_font
-    if emoji_str:
-        bbox_em = probe_draw.textbbox((0, 0), emoji_str.strip(), font=ef)
-        emoji_w = bbox_em[2] - bbox_em[0] + 10  # 10px gap
 
-    total_w = text_w + emoji_w
+def measure_width(font, text: str) -> int:
+    """Pixel width of `text` rendered in `font`, matching FFmpeg's own font metrics."""
+    if not text:
+        return 0
+    bbox = font.getbbox(text)
+    return max(bbox[2] - bbox[0], 1)
 
-    # Center text block horizontally, center vertically
-    x = (CAPTION_PNG_W - total_w) // 2 - bbox_text[0]
-    y = (CAPTION_PNG_H - text_h) // 2 - bbox_text[1]
 
-    # 1. Drop shadow
-    draw.text(
-        (x + CAPTION_SHADOW_OFF, y + CAPTION_SHADOW_OFF),
-        text, font=bold_font, fill=(0, 0, 0, 180),
-    )
+def decode_word_timings(raw):
+    """
+    Decode the `wordTimings` form field. Accepts either the raw base64 string
+    produced by /tts's X-Word-Timings header, or a plain JSON array — so the
+    endpoint is forgiving about exactly how the caller forwards it.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(base64.b64decode(raw).decode("utf-8"))
+    except Exception as exc:
+        log.warning("Could not decode wordTimings, falling back to even spacing: %s", exc)
+        return None
 
-    # 2. Main text — yellow with black stroke
-    draw.text(
-        (x, y), text, font=bold_font,
-        fill=(255, 230, 0, 255),
-        stroke_width=CAPTION_STROKE_W,
-        stroke_fill=(0, 0, 0, 255),
-    )
 
-    # 3. Emoji — right of text
-    if emoji_str:
-        x_emoji = x + text_w + bbox_text[0] + 10
-        try:
-            if emoji_font:
-                draw.text((x_emoji, y), emoji_str.strip(), font=ef, embedded_color=True)
-            else:
-                draw.text(
-                    (x_emoji, y), emoji_str.strip(), font=ef,
-                    fill=(255, 230, 0, 255),
-                    stroke_width=CAPTION_STROKE_W,
-                    stroke_fill=(0, 0, 0, 255),
-                )
-        except Exception:
-            draw.text(
-                (x_emoji, y), emoji_str.strip(), font=bold_font,
-                fill=(255, 230, 0, 255),
-                stroke_width=CAPTION_STROKE_W,
-                stroke_fill=(0, 0, 0, 255),
+def split_word_timings_by_scene(word_timings, scenes_sorted):
+    """
+    Distribute a flat, full-narration word-timing list across scenes, based on
+    each scene's durationSeconds, and re-base each word's time to be local to
+    its own scene's clip (0 = start of that scene's video).
+    """
+    result = {}
+    cursor = 0.0
+    last_num = scenes_sorted[-1]["sceneNumber"] if scenes_sorted else None
+
+    for scene in scenes_sorted:
+        num = scene["sceneNumber"]
+        dur = float(scene["durationSeconds"])
+        scene_start, scene_end = cursor, cursor + dur
+        bucket = []
+
+        for entry in word_timings:
+            word, start, end = entry[0], float(entry[1]), float(entry[2])
+            midpoint = (start + end) / 2
+            in_range = scene_start <= midpoint < scene_end
+            if not in_range and num == last_num and midpoint >= scene_end:
+                in_range = True  # catch any trailing words on the final scene
+            if not in_range:
+                continue
+            local_start = max(0.0, start - scene_start)
+            local_end = min(dur, end - scene_start)
+            if local_end > local_start:
+                bucket.append({"word": word, "start": local_start, "end": local_end})
+
+        result[num] = bucket
+        cursor = scene_end
+
+    return result
+
+
+def build_caption_words(scene_text, duration, timed_words):
+    """
+    Return a flat list of {word, start, end} (seconds, local to this scene)
+    for a scene — using real per-word timing when available, otherwise
+    falling back to evenly spacing the scene's own words across its duration.
+    """
+    if timed_words:
+        return [
+            {"word": clean_word(w["word"]), "start": w["start"], "end": w["end"]}
+            for w in timed_words
+            if clean_word(w["word"])
+        ]
+
+    words = [clean_word(w) for w in scene_text.split()]
+    words = [w for w in words if w]
+    if not words:
+        return []
+    step = duration / len(words)
+    return [
+        {"word": w, "start": i * step, "end": (i + 1) * step}
+        for i, w in enumerate(words)
+    ]
+
+
+def wrap_words_by_width(words, pil_font):
+    """
+    Group words into caption lines using each word's real measured pixel
+    width, capped at both WORDS_PER_LINE and MAX_LINE_WIDTH_PX — so a line
+    never overflows the frame even when it contains long words.
+    Returns (lines, display_widths) where display_widths[i][j] is the
+    pixel width of the j-th word (already uppercased) in lines[i].
+    """
+    lines: list[list[dict]] = []
+    widths: list[list[int]] = []
+
+    current: list[dict] = []
+    current_w: list[int] = []
+    current_total = 0
+
+    for w in words:
+        txt = w["word"].upper()
+        w_px = measure_width(pil_font, txt)
+        added_w = w_px if not current else w_px + WORD_GAP_PX
+
+        would_overflow = current and (current_total + added_w > MAX_LINE_WIDTH_PX)
+        would_exceed_count = len(current) >= WORDS_PER_LINE
+
+        if current and (would_overflow or would_exceed_count):
+            lines.append(current)
+            widths.append(current_w)
+            current, current_w, current_total = [], [], 0
+            added_w = w_px
+
+        current.append(w)
+        current_w.append(w_px)
+        current_total += added_w
+
+    if current:
+        lines.append(current)
+        widths.append(current_w)
+
+    return lines, widths
+
+
+def caption_drawtext_filters(scene_text, duration, font_path, timed_words):
+    """
+    Build FFmpeg drawtext filters for modern "karaoke" captions:
+    - Words wrapped into lines by real measured pixel width (never overflows
+      the frame), pixel-accurately centered (measured with Pillow, using the
+      same font file FFmpeg will render with)
+    - Every word sits in place as white text for its whole line's on-screen
+      window, then lights up bright yellow for the exact span it's spoken
+    - Auto emoji appended to the last word of each line where relevant
+    """
+    words = build_caption_words(scene_text, duration, timed_words)
+    if not words:
+        return []
+
+    pil_font = load_pil_font(font_path, CAPTION_FONTSIZE)
+    font_arg = f":fontfile='{font_path}'" if font_path else ""
+
+    lines, line_widths = wrap_words_by_width(words, pil_font)
+
+    filters = []
+
+    for line, widths in zip(lines, line_widths):
+        line_start = line[0]["start"]
+        line_end = min(line[-1]["end"], duration)
+        line_text = " ".join(w["word"] for w in line)
+        emoji_suffix = emoji_for_chunk(line_text)
+
+        display = [w["word"].upper() for w in line]
+        if emoji_suffix:
+            display[-1] = display[-1] + emoji_suffix
+            widths = widths[:-1] + [measure_width(pil_font, display[-1])]
+
+        total_w = sum(widths) + WORD_GAP_PX * (len(display) - 1)
+        cursor_x = max(SIDE_MARGIN_PX, (FRAME_W - total_w) // 2)
+
+        enable_line = f"gte(t\\,{line_start:.4f})*lt(t\\,{line_end:.4f})"
+
+        for word_info, txt, w_px in zip(line, display, widths):
+            escaped = escape_drawtext(txt)
+            x = cursor_x
+            cursor_x += w_px + WORD_GAP_PX
+
+            shared_style = (
+                f":fontsize={CAPTION_FONTSIZE}"
+                f":bordercolor=black:borderw={CAPTION_STROKE_W}"
+                f":shadowcolor=black@0.6:shadowx=3:shadowy=3"
+                f":x={x}:y=h*{CAPTION_Y_RATIO}"
+                f"{font_arg}"
             )
 
-    return img
+            # Base layer: plain white, visible for the whole line's window
+            filters.append(
+                f"drawtext=text='{escaped}'"
+                f":fontcolor={BASE_WORD_COLOR}"
+                f":enable={enable_line}"
+                + shared_style
+            )
+
+            # Highlight layer: bright yellow, only while THIS word is spoken —
+            # drawn on top of the base layer at the identical position, so it
+            # reads as the word "lighting up" exactly on beat with the audio.
+            word_start = max(word_info["start"], line_start)
+            word_end = min(word_info["end"], line_end)
+            if word_end > word_start:
+                enable_word = f"gte(t\\,{word_start:.4f})*lt(t\\,{word_end:.4f})"
+                filters.append(
+                    f"drawtext=text='{escaped}'"
+                    f":fontcolor={ACTIVE_WORD_COLOR}"
+                    f":enable={enable_word}"
+                    + shared_style
+                )
+
+    return filters
 
 
-def make_caption_overlays(
-    text: str,
-    duration: float,
-    bold_font_path: str,
-    emoji_font_path: str,
-    tmp_dir: str,
-    scene_num: int,
-) -> str:
+def vignette_filter() -> str:
+    """Cinema edge-darkening vignette."""
+    return "vignette=angle=PI/4:mode=backward"
+
+
+def run_ffmpeg(cmd, label: str):
     """
-    Pre-render each 2-word chunk as a Pillow PNG, save to tmp_dir,
-    and write a concat.txt for the FFmpeg concat demuxer.
-    Returns the path to caps_sN.txt (or '' if text is empty).
+    Run an FFmpeg command, log full stderr regardless of outcome.
+    Returns (success, stderr_tail).
     """
-    words = text.split()
-    if not words:
-        return ""
-
-    chunks = [
-        " ".join(words[i: i + WORDS_PER_CHUNK])
-        for i in range(0, len(words), WORDS_PER_CHUNK)
-    ]
-    chunk_dur = duration / max(len(chunks), 1)
-    png_paths: list[str] = []
-
-    for i, chunk in enumerate(chunks):
-        img = render_caption_png(chunk, bold_font_path, emoji_font_path)
-        assert img.size == (CAPTION_PNG_W, CAPTION_PNG_H), \
-            f"PNG size mismatch: {img.size} != {(CAPTION_PNG_W, CAPTION_PNG_H)}"
-        png_path = os.path.join(tmp_dir, f"cap_s{scene_num}_{i:03d}.png")
-        img.save(png_path, "PNG")
-        png_paths.append(png_path)
-        log.info(
-            "Cap PNG s%d[%d/%d] %r → [%.3f, %.3f]",
-            scene_num, i, len(chunks) - 1, chunk, i * chunk_dur, (i + 1) * chunk_dur,
-        )
-
-    concat_path = os.path.join(tmp_dir, f"caps_s{scene_num}.txt")
-    with open(concat_path, "w", encoding="utf-8") as f:
-        for p in png_paths:
-            f.write(f"file '{p.replace(chr(92), '/')}'\n")
-            f.write(f"duration {chunk_dur:.6f}\n")
-        # Sentinel: repeat last entry so demuxer knows the final frame PTS
-        f.write(f"file '{png_paths[-1].replace(chr(92), '/')}'\n")
-
-    return concat_path
-
-
-# ── FFmpeg helpers ────────────────────────────────────────────────────────────
-
-def run_ffmpeg(cmd: list[str], label: str) -> tuple[bool, str]:
-    """Run FFmpeg, log stderr. Returns (success, stderr)."""
-    log.info("FFmpeg [%s]: %s", label, " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    log.info("FFmpeg [%s] exit=%d\n%s", label, result.returncode, result.stderr)
-    return result.returncode == 0, result.stderr
+    log.info("FFmpeg [%s] start: %s", label, " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    stderr = result.stderr
+    log.info("FFmpeg [%s] exit=%d stderr:\n%s", label, result.returncode, stderr)
+    return result.returncode == 0, stderr
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -296,12 +442,32 @@ class TTSRequest(BaseModel):
 @app.post("/tts")
 async def generate_speech(req: TTSRequest):
     communicate = edge_tts.Communicate(req.text, req.voice)
-    buf = io.BytesIO()
+    audio_buffer = io.BytesIO()
+    word_timings = []
+
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
-            buf.write(chunk["data"])
-    buf.seek(0)
-    return Response(content=buf.read(), media_type="audio/mpeg")
+            audio_buffer.write(chunk["data"])
+        elif chunk["type"] == "WordBoundary":
+            # offset/duration are in 100-nanosecond units
+            start = round(chunk["offset"] / 1e7, 3)
+            end = round((chunk["offset"] + chunk["duration"]) / 1e7, 3)
+            word_timings.append([chunk["text"], start, end])
+
+    audio_buffer.seek(0)
+    audio_bytes = audio_buffer.read()
+
+    timings_b64 = base64.b64encode(
+        json.dumps(word_timings, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+
+    log.info("TTS generated: %d bytes audio, %d words timed", len(audio_bytes), len(word_timings))
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={"X-Word-Timings": timings_b64},
+    )
 
 
 # ── Render ────────────────────────────────────────────────────────────────────
@@ -314,146 +480,110 @@ async def render_short(
     video3: UploadFile,
     video4: UploadFile,
     scenes: str = Form(...),
+    wordTimings: str = Form(None),
 ):
-    log.info("Render request received (v6 Pillow captions, 2-pass, 4K-safe)")
-    scene_data = json.loads(scenes)
-    uploads    = {1: video1, 2: video2, 3: video3, 4: video4}
-    bold_font  = _find_font(_BOLD_FONT_CANDIDATES)
-    emoji_font = _find_font(_EMOJI_FONT_CANDIDATES)
-    log.info("Fonts: bold=%s  emoji=%s", bold_font or "(default)", emoji_font or "(none)")
+    log.info("Render request received (v4 word-accurate captions)")
+    scene_data = sorted(json.loads(scenes), key=lambda s: s["sceneNumber"])
+    uploads = {1: video1, 2: video2, 3: video3, 4: video4}
+    font_path = build_font_path()
+
+    raw_word_timings = decode_word_timings(wordTimings)
+    per_scene_words = (
+        split_word_timings_by_scene(raw_word_timings, scene_data)
+        if raw_word_timings
+        else {}
+    )
+    log.info(
+        "Word timings: %s",
+        "using real per-word timing" if raw_word_timings else "none supplied, using even spacing",
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
 
-        # ── 1. Write audio ─────────────────────────────────────────────────
-        audio_path  = os.path.join(tmp, "audio.mp3")
+        # ── 1. Write audio ────────────────────────────────────────────────
+        audio_path = os.path.join(tmp, "audio.mp3")
         audio_bytes = await audio.read()
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
-        log.info("Audio: %d bytes", len(audio_bytes))
+        log.info("Audio written: %d bytes", len(audio_bytes))
         del audio_bytes
         gc.collect()
 
-        processed_clips: list[str]   = []
-        scene_durations: list[float] = []
+        processed_clips = []
 
-        # ── 2. Process each scene ──────────────────────────────────────────
-        for scene in sorted(scene_data, key=lambda s: s["sceneNumber"]):
-            num      = scene["sceneNumber"]
+        # ── 2. Process each scene independently ───────────────────────────
+        for scene in scene_data:
+            num = scene["sceneNumber"]
             duration = float(scene["durationSeconds"])
-            log.info("Scene %d | %.1fs | %r", num, duration, scene["text"])
+            log.info("Scene %d | duration=%.1fs | text=%r", num, duration, scene["text"])
 
-            # Write raw video
-            raw_path  = os.path.join(tmp, f"raw{num}.mp4")
+            raw_path = os.path.join(tmp, f"raw{num}.mp4")
             raw_bytes = await uploads[num].read()
+
             mb = len(raw_bytes) / (1024 * 1024)
             if mb > MAX_INPUT_MB:
+                log.error("Scene %d video too large: %.1f MB (limit %d MB)", num, mb, MAX_INPUT_MB)
                 return Response(
-                    content=f"Scene {num} video is {mb:.1f} MB; limit {MAX_INPUT_MB} MB.",
-                    media_type="text/plain", status_code=413,
+                    content=f"Scene {num} video is {mb:.1f} MB; limit is {MAX_INPUT_MB} MB.",
+                    media_type="text/plain",
+                    status_code=413,
                 )
+
             with open(raw_path, "wb") as f:
                 f.write(raw_bytes)
-            log.info("Scene %d raw: %.1f MB", num, mb)
+            log.info("Scene %d raw written: %.1f MB", num, mb)
             del raw_bytes
             gc.collect()
 
-            scaled_path = os.path.join(tmp, f"scaled{num}.mp4")
-            clip_path   = os.path.join(tmp, f"clip{num}.mp4")
+            clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
-            # ── Pass 1: 4K → 1080×1920 + vignette ────────────────────────
-            # Single stream: decode 4K → scale → vignette → encode 1080p.
-            # No second stream = no overlay = safe on 512 MB free-tier.
+            scale_crop = (
+                "scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920"
+            )
+            vignette = vignette_filter()
+            captions = caption_drawtext_filters(
+                scene["text"], duration, font_path, per_scene_words.get(num)
+            )
+
+            vf = ",".join([scale_crop, vignette] + captions)
+
             ok, stderr = run_ffmpeg([
                 "ffmpeg", "-y",
-                "-stream_loop", "-1", "-t", str(duration), "-i", raw_path,
-                "-vf", (
-                    "scale=1080:1920:force_original_aspect_ratio=increase,"
-                    "crop=1080:1920,"
-                    "vignette=angle=PI/4:mode=backward"
-                ),
+                "-stream_loop", "-1", "-i", raw_path,
+                "-t", str(duration),
+                "-vf", vf,
                 "-an",
                 "-c:v", "libx264",
-                "-preset", PRESET_SCALE,
-                "-crf", CRF_SCALE,
+                "-preset", PRESET,
+                "-crf", CRF,
+                "-maxrate", MAX_BITRATE,
+                "-bufsize", BUF_SIZE,
                 "-threads", THREADS,
                 "-r", "30",
                 "-pix_fmt", "yuv420p",
-                scaled_path,
-            ], label=f"scale{num}")
+                clip_path,
+            ], label=f"scene{num}")
 
-            os.remove(raw_path)   # free disk immediately
-
-            if not ok:
-                return Response(
-                    content=f"FFmpeg scale failed on scene {num}:\n{stderr[-3000:]}",
-                    media_type="text/plain", status_code=500,
-                )
-
-            # ── Pre-render caption PNGs (Pillow) ──────────────────────────
-            caps_txt = make_caption_overlays(
-                scene["text"], duration, bold_font, emoji_font, tmp, num
-            )
-
-            # ── Pass 2: overlay Pillow captions onto 1080p clip ───────────
-            # Input is already 1080p → trivial RAM. concat demuxer feeds
-            # fixed-size PNGs into one overlay filter (eof_action=pass so
-            # video continues if PNG stream ends slightly early).
-            if caps_txt:
-                ok, stderr = run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-i", scaled_path,
-                    "-f", "concat", "-safe", "0", "-i", caps_txt,
-                    "-filter_complex", (
-                        f"[0:v][1:v]overlay="
-                        f"x=(W-w)/2:"
-                        f"y=H-h-{CAPTION_BOTTOM_PAD}:"
-                        f"eof_action=pass[vout]"
-                    ),
-                    "-map", "[vout]",
-                    "-an",
-                    "-c:v", "libx264",
-                    "-preset", PRESET_CAPTION,
-                    "-crf", CRF_CAPTION,
-                    "-maxrate", MAX_BITRATE,
-                    "-bufsize", BUF_SIZE,
-                    "-threads", THREADS,
-                    "-r", "30",
-                    "-pix_fmt", "yuv420p",
-                    clip_path,
-                ], label=f"caption{num}")
-            else:
-                # No text → just copy scaled clip as-is
-                import shutil
-                shutil.copy2(scaled_path, clip_path)
-                ok = True
-
-            # Cleanup
-            os.remove(scaled_path)
-            if caps_txt and os.path.exists(caps_txt):
-                os.remove(caps_txt)
-            # Remove PNGs
-            for fname in os.listdir(tmp):
-                if fname.startswith(f"cap_s{num}_") and fname.endswith(".png"):
-                    try:
-                        os.remove(os.path.join(tmp, fname))
-                    except OSError:
-                        pass
+            os.remove(raw_path)
 
             if not ok:
                 return Response(
-                    content=f"FFmpeg caption failed on scene {num}:\n{stderr[-3000:]}",
-                    media_type="text/plain", status_code=500,
+                    content=f"FFmpeg failed on scene {num}. Last stderr:\n{stderr[-3000:]}",
+                    media_type="text/plain",
+                    status_code=500,
                 )
 
             processed_clips.append(clip_path)
-            scene_durations.append(duration)
-            log.info("Scene %d done → %s", num, clip_path)
+            log.info("Scene %d encoded → %s", num, clip_path)
             gc.collect()
 
         # ── 3. Concat clips (stream-copy, zero RAM) ────────────────────────
         n = len(processed_clips)
+
         if n == 1:
             concatenated = processed_clips[0]
+            log.info("Single scene – skipping concat")
         else:
             concat_list = os.path.join(tmp, "concat.txt")
             with open(concat_list, "w") as f:
@@ -476,12 +606,13 @@ async def render_short(
 
             if not ok:
                 return Response(
-                    content=f"FFmpeg concat failed:\n{stderr[-3000:]}",
-                    media_type="text/plain", status_code=500,
+                    content=f"FFmpeg concat failed. Last stderr:\n{stderr[-3000:]}",
+                    media_type="text/plain",
+                    status_code=500,
                 )
             log.info("Concat done → %s", concatenated)
 
-        # ── 4. Mux voiceover ──────────────────────────────────────────────
+        # ── 4. Mux voiceover onto video ───────────────────────────────────
         output_path = os.path.join(tmp, "output.mp4")
         ok, stderr = run_ffmpeg([
             "ffmpeg", "-y",
@@ -503,14 +634,15 @@ async def render_short(
 
         if not ok:
             return Response(
-                content=f"FFmpeg mux failed:\n{stderr[-3000:]}",
-                media_type="text/plain", status_code=500,
+                content=f"FFmpeg mux failed. Last stderr:\n{stderr[-3000:]}",
+                media_type="text/plain",
+                status_code=500,
             )
 
         with open(output_path, "rb") as f:
             video_bytes = f.read()
 
-        log.info("Render complete (v6). Output: %.1f MB", len(video_bytes) / 1024 / 1024)
+        log.info("Render complete (v4). Output size: %.1f MB", len(video_bytes) / (1024 * 1024))
         return Response(content=video_bytes, media_type="video/mp4")
 
 
@@ -518,27 +650,34 @@ async def render_short(
 
 @app.get("/health")
 async def health_check():
-    bold  = _find_font(_BOLD_FONT_CANDIDATES)
-    emoji = _find_font(_EMOJI_FONT_CANDIDATES)
+    font = build_font_path()
     return {
-        "status":      "ok",
-        "version":     "6.0.0",
-        "bold_font":   bold  or "PIL-default",
-        "emoji_font":  emoji or "none",
+        "status": "ok",
+        "service": "ffmpeg-render-wrapper-v4-word-accurate-captions",
+        "version": "4.0.0",
+        "caption_font": font or "ffmpeg-default",
+        "caption_style": {
+            "words_per_line": WORDS_PER_LINE,
+            "fontsize": CAPTION_FONTSIZE,
+            "y_ratio": CAPTION_Y_RATIO,
+            "base_color": BASE_WORD_COLOR,
+            "active_word_color": ACTIVE_WORD_COLOR,
+        },
     }
 
 
 @app.get("/logs")
 async def get_logs():
-    """Return the last 8 KB of the render log for remote diagnosis."""
+    """Return the last 8 KB of the render error log for remote diagnosis."""
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 8192))
-            return Response(content=f.read(), media_type="text/plain")
+            tail = f.read()
+        return Response(content=tail, media_type="text/plain")
     except FileNotFoundError:
-        return Response(content="Log not yet created.", media_type="text/plain")
+        return Response(content="Log file not yet created.", media_type="text/plain")
 
 
 if __name__ == "__main__":
