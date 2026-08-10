@@ -375,13 +375,10 @@ async def render_short(
 
             vf = ",".join([scale_crop, kb, vignette] + captions)
 
-            # Render slightly longer than duration to allow xfade overlap
-            render_duration = duration + TRANSITION_DUR
-
             ok, stderr = run_ffmpeg([
                 "ffmpeg", "-y",
                 "-stream_loop", "-1", "-i", raw_path,
-                "-t", str(render_duration),
+                "-t", str(duration),
                 "-vf", vf,
                 "-an",
                 "-c:v", "libx264",
@@ -409,91 +406,45 @@ async def render_short(
             log.info("Scene %d encoded → %s", num, clip_path)
             gc.collect()
 
-        # ── 3. Sequential pairwise xfade transitions ──────────────────────
+        # ── 3. Concatenate clips (stream-copy concat — zero RAM overhead) ──
         #
-        # Process two clips at a time: clip[i-1] + clip[i] → temp file.
-        # This keeps only 2 clips in RAM at once (critical for 512 MB VMs).
-        #
-        # Offset rule: the xfade starts exactly when the LEFT clip's natural
-        # content ends.  Each clip was encoded TRANSITION_DUR seconds longer
-        # than its scene duration, so those tail frames provide the crossfade
-        # overlap material.  Offset = content_duration_of_left_clip.
+        # xfade transitions require re-encoding all clips simultaneously and
+        # consistently OOM-crash on 512 MB VMs.  Simple concat is instant,
+        # uses no extra RAM, and lets the per-scene Ken Burns + captions
+        # carry the visual quality.
         #
         n = len(processed_clips)
 
         if n == 1:
             concatenated = processed_clips[0]
-            log.info("Single scene – skipping xfade")
+            log.info("Single scene – skipping concat")
         else:
-            # current_clip  : path of the left-hand clip/intermediate
-            # content_dur   : logical (caption) duration of current_clip,
-            #                 NOT including the extra TRANSITION_DUR tail
-            current_clip    = processed_clips[0]
-            content_dur     = scene_durations[0]
-            intermediate_files: list[str] = []
+            concat_list = os.path.join(tmp, "concat.txt")
+            with open(concat_list, "w") as f:
+                for clip in processed_clips:
+                    f.write(f"file '{clip}'\n")
 
-            for i in range(1, n):
-                next_clip  = processed_clips[i]
-                transition = TRANSITIONS[(i - 1) % len(TRANSITIONS)]
-                step_out   = os.path.join(tmp, f"xfade_{i}.mp4")
+            concatenated = os.path.join(tmp, "concatenated.mp4")
+            ok, stderr = run_ffmpeg([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c", "copy",
+                concatenated,
+            ], label="concat")
 
-                # offset = where the transition starts in the left input's timeline
-                offset = content_dur   # exact end of left clip's scene content
-
-                ok, stderr = run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-i", current_clip,
-                    "-i", next_clip,
-                    "-filter_complex",
-                    (
-                        f"[0:v][1:v]xfade=transition={transition}"
-                        f":duration={TRANSITION_DUR}"
-                        f":offset={offset:.3f}[vout]"
-                    ),
-                    "-map", "[vout]",
-                    "-c:v", "libx264",
-                    "-preset", PRESET,
-                    "-crf", CRF,
-                    "-maxrate", MAX_BITRATE,
-                    "-bufsize", BUF_SIZE,
-                    "-threads", THREADS,
-                    "-r", "30",
-                    "-pix_fmt", "yuv420p",
-                    step_out,
-                ], label=f"xfade{i-1}→{i}")
-
-                # Free the two input clips immediately
-                if current_clip not in processed_clips or i > 1:
-                    try:
-                        os.remove(current_clip)
-                    except OSError:
-                        pass
-                else:
-                    # First iteration: current_clip IS processed_clips[0]
-                    try:
-                        os.remove(current_clip)
-                    except OSError:
-                        pass
+            for clip in processed_clips:
                 try:
-                    os.remove(next_clip)
+                    os.remove(clip)
                 except OSError:
                     pass
 
-                if not ok:
-                    return Response(
-                        content=f"FFmpeg xfade step {i} failed. Last stderr:\n{stderr[-3000:]}",
-                        media_type="text/plain",
-                        status_code=500,
-                    )
-
-                intermediate_files.append(step_out)
-                current_clip  = step_out
-                content_dur  += scene_durations[i]   # accumulate content duration
-                log.info("xfade step %d done → %s", i, step_out)
-                gc.collect()
-
-            concatenated = current_clip
-            log.info("All xfade steps done → %s", concatenated)
+            if not ok:
+                return Response(
+                    content=f"FFmpeg concat failed. Last stderr:\n{stderr[-3000:]}",
+                    media_type="text/plain",
+                    status_code=500,
+                )
+            log.info("Concat done → %s", concatenated)
 
         # ── 4. Mux voiceover onto video ───────────────────────────────────
         output_path = os.path.join(tmp, "output.mp4")
