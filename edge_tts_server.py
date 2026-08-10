@@ -201,8 +201,8 @@ def caption_drawtext_filters(
         display_text = chunk + emoji_for_chunk(chunk)
         escaped      = escape_drawtext(display_text)
 
-        enable_bounce = f"between(t\\,{t_start:.3f}\\,{bounce_end:.3f})"
-        enable_normal = f"between(t\\,{bounce_end:.3f}\\,{t_end:.3f})"
+        enable_bounce = f"gte(t\\,{t_start:.4f})*lt(t\\,{bounce_end:.4f})"
+        enable_normal = f"gte(t\\,{bounce_end:.4f})*lt(t\\,{t_end:.4f})"
 
         common_style = (
             f":fontcolor=yellow"
@@ -359,22 +359,19 @@ async def render_short(
             clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
             # ── Build filter chain ────────────────────────────────────────
-            # Step 1: scale + crop to 1080×1920
+            # scale+crop to 1080×1920 (no zoompan — OOM on 4K input with 512MB RAM)
             scale_crop = (
                 "scale=1080:1920:force_original_aspect_ratio=increase,"
                 "crop=1080:1920"
             )
-            # Step 2: Ken Burns zoom/pan
-            kb = ken_burns_filter(num, duration)
-            # Step 3: Vignette
+            # Vignette
             vignette = vignette_filter()
-            # Step 4: Captions (bold yellow, top, bounce-in, emoji)
+            # Captions (bold yellow, bounce-in, emoji)
             captions = caption_drawtext_filters(scene["text"], duration, font_path)
 
-            vf = ",".join([scale_crop, kb, vignette] + captions)
+            vf = ",".join([scale_crop, vignette] + captions)
 
-            # Render slightly longer than duration to allow xfade overlap
-            render_duration = duration + TRANSITION_DUR
+            render_duration = duration
 
             ok, stderr = run_ffmpeg([
                 "ffmpeg", "-y",
@@ -407,62 +404,27 @@ async def render_short(
             log.info("Scene %d encoded → %s", num, clip_path)
             gc.collect()
 
-        # ── 3. Build xfade transition chain ───────────────────────────────
-        #
-        # For N clips we need N-1 xfade filters chained together.
-        # Each xfade offset = cumulative duration of all prior scenes minus
-        # transition overlaps already consumed.
-        #
+        # ── 3. Concat clips (stream-copy, zero RAM) ────────────────────────────
+        # xfade requires full frame decode of 4K clips simultaneously → OOM.
+        # Simple concat with -c copy is instant and uses minimal memory.
         n = len(processed_clips)
 
         if n == 1:
             concatenated = processed_clips[0]
-            log.info("Single scene – skipping xfade")
+            log.info("Single scene – skipping concat")
         else:
-            input_args: list[str] = []
-            for clip in processed_clips:
-                input_args += ["-i", clip]
+            concat_list = os.path.join(tmp, "concat.txt")
+            with open(concat_list, "w") as f:
+                for clip in processed_clips:
+                    f.write(f"file '{clip}'\n")
 
-            filter_parts: list[str] = []
-            cumulative_offset = 0.0
-            prev_label = "[0:v]"
-
-            for i in range(1, n):
-                cumulative_offset += scene_durations[i - 1] - (TRANSITION_DUR if i > 1 else 0)
-                offset     = max(cumulative_offset - TRANSITION_DUR, 0)
-                transition = TRANSITIONS[(i - 1) % len(TRANSITIONS)]
-                out_label  = f"[x{i}]" if i < n - 1 else "[vout]"
-
-                filter_parts.append(
-                    f"{prev_label}[{i}:v]"
-                    f"xfade=transition={transition}"
-                    f":duration={TRANSITION_DUR}"
-                    f":offset={offset:.3f}"
-                    f"{out_label}"
-                )
-                prev_label = out_label
-
-            filter_complex = "; ".join(filter_parts)
-            concatenated   = os.path.join(tmp, "concatenated.mp4")
-
-            ok, stderr = run_ffmpeg(
-                ["ffmpeg", "-y"]
-                + input_args
-                + [
-                    "-filter_complex", filter_complex,
-                    "-map", "[vout]",
-                    "-c:v", "libx264",
-                    "-preset", PRESET,
-                    "-crf", CRF,
-                    "-maxrate", MAX_BITRATE,
-                    "-bufsize", BUF_SIZE,
-                    "-threads", THREADS,
-                    "-r", "30",
-                    "-pix_fmt", "yuv420p",
-                    concatenated,
-                ],
-                label="xfade",
-            )
+            concatenated = os.path.join(tmp, "concatenated.mp4")
+            ok, stderr = run_ffmpeg([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c", "copy",
+                concatenated,
+            ], label="concat")
 
             for clip in processed_clips:
                 try:
@@ -472,11 +434,11 @@ async def render_short(
 
             if not ok:
                 return Response(
-                    content=f"FFmpeg xfade failed. Last stderr:\n{stderr[-3000:]}",
+                    content=f"FFmpeg concat failed. Last stderr:\n{stderr[-3000:]}",
                     media_type="text/plain",
                     status_code=500,
                 )
-            log.info("xfade concat done → %s", concatenated)
+            log.info("Concat done → %s", concatenated)
 
         # ── 4. Mux voiceover onto video ───────────────────────────────────
         output_path = os.path.join(tmp, "output.mp4")
