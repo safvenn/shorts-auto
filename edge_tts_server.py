@@ -71,6 +71,11 @@ CAPTION_FONT_SIZE    = 82     # large, punchy
 CAPTION_STROKE_W     = 5      # black border thickness (px)
 CAPTION_SHADOW_OFF   = 5      # drop shadow offset (px)
 CAPTION_BOTTOM_PAD   = 430    # px from bottom of frame to bottom of caption
+# CRITICAL: ALL caption PNGs must be EXACTLY this size.
+# The concat demuxer feeds them into one overlay filter; any size change
+# causes FFmpeg to "Reconfigure filter graph" and produce 0 frames.
+CAPTION_PNG_W        = VIDEO_W - 20   # 1060px — fixed width
+CAPTION_PNG_H        = 150            # fixed height (fits font+stroke+shadow)
 
 # ── Emoji keyword map ─────────────────────────────────────────────────────────
 EMOJI_MAP: dict[str, str] = {
@@ -150,52 +155,51 @@ def render_caption_png(
     font_size: int = CAPTION_FONT_SIZE,
 ) -> Image.Image:
     """
-    Render a caption string as a transparent RGBA PNG image using Pillow.
+    Render caption as a FIXED-SIZE (CAPTION_PNG_W x CAPTION_PNG_H) transparent RGBA PNG.
 
-    Styling:
-    - Bold yellow text (#FFE600) — high contrast on any background
-    - Black stroke (border) CAPTION_STROKE_W px thick
-    - Black drop shadow offset CAPTION_SHADOW_OFF px
-    - Transparent background → composites cleanly over video
-    - Color emoji rendered if NotoColorEmoji is available
+    IMPORTANT: Fixed size is critical — the concat demuxer feeds all caption PNGs
+    into a single overlay filter. If any PNG differs in size, FFmpeg reconfigures
+    the filter graph and produces 0 output frames (silent crash).
+
+    All text/emoji is centered in this fixed canvas.
     """
-    bold_font = _load_font(bold_font_path, font_size)
+    bold_font  = _load_font(bold_font_path, font_size)
     emoji_font = _load_font(emoji_font_path, font_size) if emoji_font_path else None
 
-    pad_x, pad_y = 28, 18
-    probe = Image.new("RGBA", (VIDEO_W * 2, font_size * 4), (0, 0, 0, 0))
+    # ── Fixed canvas — MUST match CAPTION_PNG_W × CAPTION_PNG_H exactly ──────
+    img  = Image.new("RGBA", (CAPTION_PNG_W, CAPTION_PNG_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Measure text on a probe canvas
+    probe      = Image.new("RGBA", (CAPTION_PNG_W * 2, CAPTION_PNG_H * 4), (0, 0, 0, 0))
     probe_draw = ImageDraw.Draw(probe)
 
-    bbox_text = probe_draw.textbbox((0, 0), chunk_text, font=bold_font, stroke_width=CAPTION_STROKE_W)
+    bbox_text = probe_draw.textbbox(
+        (0, 0), chunk_text, font=bold_font, stroke_width=CAPTION_STROKE_W
+    )
     text_w = bbox_text[2] - bbox_text[0]
     text_h = bbox_text[3] - bbox_text[1]
 
+    # Measure emoji width if present
     emoji_w = 0
-    emoji_h = text_h
+    ef = emoji_font if emoji_font else bold_font
     if emoji_str:
-        ef = emoji_font if emoji_font else bold_font
-        bbox_emoji = probe_draw.textbbox((0, 0), emoji_str, font=ef)
-        emoji_w = bbox_emoji[2] - bbox_emoji[0]
-        emoji_h = max(text_h, bbox_emoji[3] - bbox_emoji[1])
+        bbox_em = probe_draw.textbbox((0, 0), emoji_str, font=ef)
+        emoji_w = bbox_em[2] - bbox_em[0] + 8  # 8px gap
 
-    total_w = text_w + (emoji_w if emoji_str else 0)
-    img_w = min(total_w + pad_x * 2 + 10, VIDEO_W - 20)
-    img_h = max(text_h, emoji_h) + pad_y * 2 + CAPTION_SHADOW_OFF
+    total_w = text_w + emoji_w
 
-    img  = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    # Center the whole group horizontally, center text vertically
+    x = (CAPTION_PNG_W - total_w) // 2 - bbox_text[0]
+    y = (CAPTION_PNG_H - text_h) // 2 - bbox_text[1]
 
-    x = pad_x - bbox_text[0]
-    y = pad_y - bbox_text[1]
-
-    # 1. Drop shadow for text
+    # 1. Drop shadow
     draw.text(
         (x + CAPTION_SHADOW_OFF, y + CAPTION_SHADOW_OFF),
-        chunk_text, font=bold_font,
-        fill=(0, 0, 0, 170),
+        chunk_text, font=bold_font, fill=(0, 0, 0, 170),
     )
 
-    # 2. Main text with black stroke then yellow fill
+    # 2. Main text (yellow with black stroke)
     draw.text(
         (x, y), chunk_text, font=bold_font,
         fill=(255, 230, 0, 255),
@@ -203,10 +207,9 @@ def render_caption_png(
         stroke_fill=(0, 0, 0, 255),
     )
 
-    # 3. Draw emoji if present
+    # 3. Emoji (right of text)
     if emoji_str:
-        x_emoji = x + text_w + 10
-        ef = emoji_font if emoji_font else bold_font
+        x_emoji = x + text_w + bbox_text[0] + 8
         try:
             if emoji_font:
                 draw.text((x_emoji, y), emoji_str, font=ef, embedded_color=True)
@@ -218,7 +221,6 @@ def render_caption_png(
                     stroke_fill=(0, 0, 0, 255),
                 )
         except Exception:
-            # Fallback if embedded_color fails
             draw.text(
                 (x_emoji, y), emoji_str, font=bold_font,
                 fill=(255, 230, 0, 255),
