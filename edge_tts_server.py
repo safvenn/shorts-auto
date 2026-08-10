@@ -236,21 +236,22 @@ def make_caption_overlays(
     emoji_font_path: str,
     tmp_dir: str,
     scene_num: int,
-) -> list[tuple[str, float, float]]:
+) -> tuple[str, list[str]]:
     """
-    Pre-render each 2-word chunk as a PNG, save to tmp_dir.
-    Returns [(png_path, t_start, t_end), ...] — timing is EXACT (zero lag).
+    Pre-render each 2-word chunk as a PNG, save to tmp_dir, and generate caps.txt
+    for the FFmpeg concat demuxer.
+    Returns (concat_txt_path, list_of_png_paths). Zero-lag, exact timing.
     """
     words = text.split()
     if not words:
-        return []
+        return "", []
 
     chunks = [
         " ".join(words[i: i + WORDS_PER_CHUNK])
         for i in range(0, len(words), WORDS_PER_CHUNK)
     ]
     chunk_dur = duration / max(len(chunks), 1)
-    overlays: list[tuple[str, float, float]] = []
+    png_paths: list[str] = []
 
     for i, chunk in enumerate(chunks):
         t_start = i * chunk_dur
@@ -260,13 +261,26 @@ def make_caption_overlays(
         img = render_caption_png(clean_chunk, emoji_str, bold_font_path, emoji_font_path)
         png_path = os.path.join(tmp_dir, f"cap_s{scene_num}_{i:03d}.png")
         img.save(png_path, "PNG")
-        overlays.append((png_path, t_start, t_end))
+        png_paths.append(png_path)
         log.info(
             "Cap PNG s%d[%d] '%s%s' [%.3f,%.3f] size=%dx%d",
             scene_num, i, clean_chunk, emoji_str, t_start, t_end, img.width, img.height,
         )
 
-    return overlays
+    if not png_paths:
+        return "", []
+
+    concat_txt_path = os.path.join(tmp_dir, f"caps_s{scene_num}.txt")
+    with open(concat_txt_path, "w", encoding="utf-8") as f:
+        for p in png_paths:
+            normalized_path = p.replace("\\", "/")
+            f.write(f"file '{normalized_path}'\n")
+            f.write(f"duration {chunk_dur:.4f}\n")
+        # FFmpeg concat demuxer requirement: repeat last entry
+        normalized_last = png_paths[-1].replace("\\", "/")
+        f.write(f"file '{normalized_last}'\n")
+
+    return concat_txt_path, png_paths
 
 
 # ── FFmpeg wrapper ────────────────────────────────────────────────────────────
@@ -308,7 +322,7 @@ async def render_short(
     video4: UploadFile,
     scenes: str = Form(...),
 ):
-    log.info("Render request received (v4 Pillow captions + High Quality)")
+    log.info("Render request received (v4 Pillow captions + Concat Demuxer + High Quality)")
     scene_data = json.loads(scenes)
     uploads    = {1: video1, 2: video2, 3: video3, 4: video4}
     bold_font  = _find_font(_BOLD_FONT_CANDIDATES)
@@ -353,59 +367,25 @@ async def render_short(
 
             clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
-            # ── Pre-render caption PNGs via Pillow ─────────────────────────
-            overlays = make_caption_overlays(
+            # ── Pre-render caption PNGs & concat.txt via Pillow ─────────────
+            concat_txt_path, png_paths = make_caption_overlays(
                 scene["text"], duration, bold_font, emoji_font, tmp, num
             )
 
             # ── Build FFmpeg command ────────────────────────────────────────
-            base_cmd = [
-                "ffmpeg", "-y",
-                "-stream_loop", "-1", "-i", raw_path,
-            ]
-
-            # Add each caption PNG as a looped 30fps input stream
-            for png_path, _, _ in overlays:
-                base_cmd += ["-loop", "1", "-framerate", "30", "-i", png_path]
-
-            scale_filter = (
-                "[0:v]"
-                "scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920"
-                "[base]"
-            )
-
-            if overlays:
-                filter_parts = [scale_filter]
-                prev = "[base]"
-                for j, (_, t_start, t_end) in enumerate(overlays):
-                    in_idx   = j + 1          # input index: 0=video, 1..N=PNGs
-                    out_lbl  = f"[v{j}]" if j < len(overlays) - 1 else "[vout]"
-                    filter_parts.append(
-                        f"{prev}[{in_idx}:v]"
-                        f"overlay="
-                        f"x=(W-w)/2:"
-                        f"y=H-h-{CAPTION_BOTTOM_PAD}:"
-                        f"enable='between(t,{t_start:.4f},{t_end:.4f})'"
-                        f"{out_lbl}"
-                    )
-                    prev = out_lbl
-                filter_complex = ";".join(filter_parts)
-                map_arg = "[vout]"
-            else:
-                filter_complex = (
-                    "[0:v]"
-                    "scale=1080:1920:force_original_aspect_ratio=increase,"
-                    "crop=1080:1920"
-                    "[vout]"
-                )
-                map_arg = "[vout]"
-
-            ok, stderr = run_ffmpeg(
-                base_cmd + [
+            # If captions exist, feed video (#0) + caps concat stream (#1)
+            # Uses 1 single overlay filter for zero lag and minimal RAM
+            if concat_txt_path:
+                ok, stderr = run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-stream_loop", "-1", "-i", raw_path,
+                    "-f", "concat", "-safe", "0", "-i", concat_txt_path,
                     "-t", str(duration),
-                    "-filter_complex", filter_complex,
-                    "-map", map_arg,
+                    "-filter_complex", (
+                        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[base];"
+                        f"[base][1:v]overlay=x=(W-w)/2:y=H-h-{CAPTION_BOTTOM_PAD}[vout]"
+                    ),
+                    "-map", "[vout]",
                     "-an",
                     "-c:v", "libx264",
                     "-preset", PRESET,
@@ -416,13 +396,30 @@ async def render_short(
                     "-r", "30",
                     "-pix_fmt", "yuv420p",
                     clip_path,
-                ],
-                label=f"scene{num}",
-            )
+                ], label=f"scene{num}")
+            else:
+                ok, stderr = run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-stream_loop", "-1", "-i", raw_path,
+                    "-t", str(duration),
+                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                    "-an",
+                    "-c:v", "libx264",
+                    "-preset", PRESET,
+                    "-crf", CRF,
+                    "-maxrate", MAX_BITRATE,
+                    "-bufsize", BUF_SIZE,
+                    "-threads", THREADS,
+                    "-r", "30",
+                    "-pix_fmt", "yuv420p",
+                    clip_path,
+                ], label=f"scene{num}")
 
-            # Clean up raw + caption PNGs
+            # Clean up raw + caption files
             os.remove(raw_path)
-            for png_path, _, _ in overlays:
+            if concat_txt_path and os.path.exists(concat_txt_path):
+                os.remove(concat_txt_path)
+            for png_path in png_paths:
                 try:
                     os.remove(png_path)
                 except OSError:
@@ -510,8 +507,8 @@ async def health_check():
     emoji = _find_font(_EMOJI_FONT_CANDIDATES)
     return {
         "status": "ok",
-        "service": "ffmpeg-render-wrapper-v4-pillow",
-        "version": "4.0.0",
+        "service": "ffmpeg-render-wrapper-v4-pillow-concat",
+        "version": "4.1.0",
         "bold_font":  bold  or "PIL default",
         "emoji_font": emoji or "not found",
         "crf": CRF, "preset": PRESET,
