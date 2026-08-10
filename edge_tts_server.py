@@ -85,7 +85,7 @@ MAX_INPUT_MB = 80
 
 # ── Caption constants ─────────────────────────────────────────────────────────
 WORDS_PER_CHUNK     = 2      # 2 words at a time — punchy Short pacing
-CAPTION_Y           = "120"  # distance from top in pixels
+CAPTION_Y           = "h-text_h-280"  # lower-third: ~280px above bottom
 CAPTION_FONTSIZE    = 72     # base font size
 CAPTION_BOUNCE_SIZE = 92     # oversized during bounce-in
 CAPTION_BOUNCE_DUR  = 0.15   # seconds the pop/bounce lasts
@@ -361,19 +361,15 @@ async def render_short(
             clip_path = os.path.join(tmp, f"clip{num}.mp4")
 
             # ── Build filter chain ────────────────────────────────────────
-            # Step 1: scale + crop to 1080×1920
+            # Scale + crop to 1080×1920, then captions (bold yellow, lower-
+            # third, bounce-in pop, auto emoji).  No Ken Burns / vignette.
             scale_crop = (
                 "scale=1080:1920:force_original_aspect_ratio=increase,"
                 "crop=1080:1920"
             )
-            # Step 2: Ken Burns zoom/pan
-            kb = ken_burns_filter(num, duration)
-            # Step 3: Vignette
-            vignette = vignette_filter()
-            # Step 4: Captions (bold yellow, top, bounce-in, emoji)
             captions = caption_drawtext_filters(scene["text"], duration, font_path)
 
-            vf = ",".join([scale_crop, kb, vignette] + captions)
+            vf = ",".join([scale_crop] + captions)
 
             ok, stderr = run_ffmpeg([
                 "ffmpeg", "-y",
