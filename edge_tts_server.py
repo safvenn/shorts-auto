@@ -90,7 +90,7 @@ app = FastAPI(title="Shorts Auto", version="2.1.0")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def wrap_caption(text: str, width: int = 28) -> str:
-    """Break caption into short lines; \N is FFmpeg drawtext's forced newline."""
+    """Break caption into short lines; \\N is FFmpeg drawtext's forced newline."""
     return r"\N".join(textwrap.wrap(text, width=width))
 
 
