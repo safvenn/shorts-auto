@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 edge-tts
 python-multipart
+Pillow
