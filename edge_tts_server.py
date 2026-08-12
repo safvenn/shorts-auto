@@ -114,6 +114,13 @@ MAX_LINE_WIDTH_PX  = FRAME_W - 2 * SIDE_MARGIN_PX  # hard cap — lines never ov
 BASE_WORD_COLOR    = "white"
 ACTIVE_WORD_COLOR  = "0xFFE600" # bright yellow — the word being spoken right now
 
+# Edge TTS MP3 encoder delay (seconds). WordBoundary offsets are measured from
+# the TTS engine's internal clock, but the MP3 container has a small encoder
+# priming delay (~0.05 s on most Edge voices). Subtracting this value shifts
+# captions forward so they align with the actual audio playback. Tune to 0.0
+# to disable. Values between 0.04 and 0.08 are typical.
+EDGE_TTS_AUDIO_OFFSET_S = 0.05
+
 # Cycle of xfade transition names (FFmpeg built-ins) — currently unused (see
 # render_short: concat uses stream-copy for RAM safety) but kept for future use.
 TRANSITIONS = ["fade", "slideleft", "wipeleft", "zoomin"]
@@ -161,11 +168,14 @@ def clean_word(word: str) -> str:
 
 
 def emoji_for_chunk(chunk: str) -> str:
-    """Return a single emoji for a line of text based on keyword lookup, or ''."""
-    for word in chunk.lower().split():
-        clean = word.strip(".,!?;:")
-        if clean in EMOJI_MAP:
-            return " " + EMOJI_MAP[clean]
+    """Return a single emoji for a line of text based on keyword lookup, or ''.
+
+    NOTE: Emoji are intentionally NOT injected into FFmpeg drawtext filters
+    because FreeType (used by FFmpeg drawtext) cannot render color emoji glyphs
+    — they appear as blank boxes. This function is kept for future use with an
+    image-overlay approach (e.g. Pillow composite frames) but currently returns
+    an empty string so no boxes appear in the rendered video.
+    """
     return ""
 
 
@@ -449,9 +459,14 @@ async def generate_speech(req: TTSRequest):
         if chunk["type"] == "audio":
             audio_buffer.write(chunk["data"])
         elif chunk["type"] == "WordBoundary":
-            # offset/duration are in 100-nanosecond units
-            start = round(chunk["offset"] / 1e7, 3)
-            end = round((chunk["offset"] + chunk["duration"]) / 1e7, 3)
+            # offset/duration are in 100-nanosecond units.
+            # We subtract EDGE_TTS_AUDIO_OFFSET_S to compensate for the MP3
+            # encoder priming delay — without this the captions run ~50 ms late
+            # relative to the actual audio playback.
+            raw_start = chunk["offset"] / 1e7
+            raw_end   = (chunk["offset"] + chunk["duration"]) / 1e7
+            start = round(max(0.0, raw_start - EDGE_TTS_AUDIO_OFFSET_S), 3)
+            end   = round(max(start + 0.001, raw_end - EDGE_TTS_AUDIO_OFFSET_S), 3)
             word_timings.append([chunk["text"], start, end])
 
     audio_buffer.seek(0)
